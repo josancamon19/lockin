@@ -1,0 +1,819 @@
+"""Interactive terminal UI — replaces the old Typer-based CLI (v0.2)."""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+
+from lockin import __version__
+from lockin.apps import list_installed_apps
+from lockin.blocker import apply_blocks, remove_blocks
+from lockin.config import Config, Profile, Schedule, load_config, save_config
+from lockin.daemon import install_daemon, is_daemon_installed, uninstall_daemon
+from lockin.presets import PRESETS, SUBDOMAIN_PREFIXES, list_presets
+from lockin.session import (
+    Session,
+    create_session,
+    delete_session,
+    get_active_session,
+    load_session,
+)
+from lockin.ui import (
+    console,
+    format_duration,
+    live_countdown,
+    print_error,
+    print_info,
+    print_success,
+    print_warning,
+    prompt_confirm,
+    prompt_pick_numbers,
+    prompt_text,
+    show_always_blocked,
+    show_banner,
+    show_menu,
+    show_numbered_list,
+    show_presets,
+    show_profile_detail,
+    show_profiles,
+    show_schedules,
+    show_status,
+    show_summary_panel,
+)
+
+
+# ---------------------------------------------------------------------------
+# Duration parsing
+# ---------------------------------------------------------------------------
+
+def _parse_duration(duration_str: str) -> int | None:
+    """Parse duration string like '2h', '30m', '1h30m', '90s' into seconds.
+
+    Returns None on failure instead of raising.
+    """
+    pattern = r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?"
+    match = re.fullmatch(pattern, duration_str.strip())
+    if not match or not any(match.groups()):
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    total = hours * 3600 + minutes * 60 + seconds
+    return total if total > 0 else None
+
+
+# ---------------------------------------------------------------------------
+# CLI shortcuts  (--version, --status, --start-session)
+# ---------------------------------------------------------------------------
+
+def _handle_argv() -> bool:
+    """Handle CLI shortcut flags.  Returns True if a shortcut was handled."""
+    args = sys.argv[1:]
+    if not args:
+        return False
+
+    # --version / -v
+    if args[0] in ("--version", "-v"):
+        console.print(f"lockin v{__version__}")
+        return True
+
+    # --status
+    if args[0] == "--status":
+        session = load_session()
+        if session and session.verify() and not session.is_expired:
+            show_status(session)
+        else:
+            show_status(None)
+        return True
+
+    # --start-session <profile> --duration <dur>  (used by sudo re-exec)
+    if args[0] == "--start-session":
+        _handle_start_session_shortcut(args[1:])
+        return True
+
+    # Unknown flag — print help hint
+    print_error(f"Unknown option: {args[0]}")
+    console.print("[dim]Usage: lockin              (interactive menu)[/dim]")
+    console.print("[dim]       lockin --version    (show version)[/dim]")
+    console.print("[dim]       lockin --status     (show session status)[/dim]")
+    return True
+
+
+def _handle_start_session_shortcut(args: list[str]) -> None:
+    """Process ``--start-session <profile> --duration <dur>`` (root only)."""
+    if os.geteuid() != 0:
+        print_error("--start-session requires root. This flag is used internally by sudo re-exec.")
+        sys.exit(1)
+
+    profile_name: str | None = None
+    duration_str: str = "1h"
+    i = 0
+    while i < len(args):
+        if args[i] == "--duration" and i + 1 < len(args):
+            duration_str = args[i + 1]
+            i += 2
+        elif profile_name is None:
+            profile_name = args[i]
+            i += 1
+        else:
+            print_error(f"Unexpected argument: {args[i]}")
+            sys.exit(1)
+
+    if not profile_name:
+        print_error("Missing profile name after --start-session.")
+        sys.exit(1)
+
+    duration_seconds = _parse_duration(duration_str)
+    if duration_seconds is None:
+        print_error(f"Invalid duration '{duration_str}'. Use format like: 2h, 30m, 1h30m")
+        sys.exit(1)
+
+    _do_start_session(profile_name, duration_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Session start logic (shared by interactive flow and shortcut)
+# ---------------------------------------------------------------------------
+
+def _do_start_session(profile_name: str, duration_seconds: int) -> None:
+    """Apply blocks and create a session.  Must be running as root."""
+    active = get_active_session()
+    if active:
+        print_error(
+            f"A session is already active (profile: {active.profile_name}, "
+            f"remaining: {format_duration(active.remaining_seconds)}). Cannot start another."
+        )
+        sys.exit(1)
+
+    config = load_config()
+    profile = config.profiles.get(profile_name)
+    if profile is None:
+        print_error(f"Profile '{profile_name}' not found.")
+        sys.exit(1)
+
+    blocked_domains = profile.resolve_domains()
+    blocked_apps = profile.resolve_apps()
+
+    # Add always-blocked items
+    for site in config.always_blocked.sites:
+        for prefix in SUBDOMAIN_PREFIXES:
+            d = f"{prefix}{site}"
+            if d not in blocked_domains:
+                blocked_domains.append(d)
+    for a in config.always_blocked.apps:
+        if a not in blocked_apps:
+            blocked_apps.append(a)
+
+    if not blocked_domains and not blocked_apps:
+        print_warning("This profile has nothing to block. Add presets or custom sites first.")
+        sys.exit(1)
+
+    # Ensure daemon
+    if not is_daemon_installed():
+        print_warning("Watchdog daemon is not installed. Installing now...")
+        if not install_daemon():
+            print_error("Failed to install watchdog daemon.")
+            sys.exit(1)
+        print_success("Watchdog daemon installed.")
+
+    # Apply blocks
+    if blocked_domains:
+        if not apply_blocks(blocked_domains):
+            print_error("Failed to apply website blocks. Are you running as root?")
+            sys.exit(1)
+
+    # Kill blocked apps
+    from lockin.apps import kill_blocked_apps
+
+    killed = kill_blocked_apps(blocked_apps)
+    if killed:
+        print_info(f"Killed blocked apps: {', '.join(killed)}")
+
+    # Create signed session
+    sess = create_session(
+        profile_name=profile_name,
+        duration_seconds=duration_seconds,
+        blocked_domains=blocked_domains,
+        blocked_apps=blocked_apps,
+    )
+
+    print_success("Focus session started!")
+    print_info(f"Profile: {profile_name}")
+    print_info(f"Duration: {format_duration(duration_seconds)}")
+    print_info(f"Blocking: {len(blocked_domains)} domains, {len(blocked_apps)} apps")
+    print_warning("This session cannot be stopped until the timer expires.")
+
+    # Show live countdown
+    live_countdown(sess)
+
+
+# ---------------------------------------------------------------------------
+# Main menu
+# ---------------------------------------------------------------------------
+
+MAIN_MENU_OPTIONS = [
+    ("1", "Start a Focus Session  \u2014  pick profile, duration, go"),
+    ("2", "Manage Profiles        \u2014  create / view / edit / delete"),
+    ("3", "Manage Schedules       \u2014  create / list / delete"),
+    ("4", "Always-Blocked Sites   \u2014  add / remove domains"),
+    ("5", "View Presets           \u2014  show built-in categories (read-only)"),
+    ("6", "Settings & Info        \u2014  daemon status, installed apps, version"),
+    ("0", "Exit"),
+]
+
+
+def _main_menu() -> None:
+    """Run the interactive main menu loop."""
+    show_banner()
+
+    while True:
+        choice = show_menu("Main Menu", MAIN_MENU_OPTIONS)
+        if choice == "1":
+            _flow_start_session()
+        elif choice == "2":
+            _flow_manage_profiles()
+        elif choice == "3":
+            _flow_manage_schedules()
+        elif choice == "4":
+            _flow_always_blocked()
+        elif choice == "5":
+            _flow_view_presets()
+        elif choice == "6":
+            _flow_settings()
+        elif choice == "0":
+            console.print("[dim]Goodbye![/dim]")
+            break
+
+
+# ---------------------------------------------------------------------------
+# Flow: Start a Focus Session
+# ---------------------------------------------------------------------------
+
+DURATION_OPTIONS = [
+    ("1", "30 minutes"),
+    ("2", "1 hour"),
+    ("3", "2 hours"),
+    ("4", "4 hours"),
+    ("5", "Custom"),
+    ("0", "Back"),
+]
+
+DURATION_MAP = {"1": "30m", "2": "1h", "3": "2h", "4": "4h"}
+
+
+def _flow_start_session() -> None:
+    config = load_config()
+
+    if not config.profiles:
+        print_warning("No profiles yet. Let's create one first.")
+        _flow_create_profile()
+        config = load_config()
+        if not config.profiles:
+            return
+
+    # Pick profile
+    profile_names = list(config.profiles.keys())
+    show_numbered_list("Select a profile", profile_names)
+    nums = prompt_pick_numbers("Profile number", len(profile_names))
+    if not nums:
+        return
+    profile_name = profile_names[nums[0] - 1]
+    profile = config.profiles[profile_name]
+
+    # Show what this profile blocks
+    show_profile_detail(profile)
+
+    # Pick duration
+    choice = show_menu("Session Duration", DURATION_OPTIONS)
+    if choice == "0":
+        return
+
+    if choice == "5":
+        raw = prompt_text("Enter duration (e.g. 1h30m, 45m, 2h)")
+        duration_seconds = _parse_duration(raw)
+        if duration_seconds is None:
+            print_error(f"Invalid duration '{raw}'.")
+            return
+    else:
+        duration_seconds = _parse_duration(DURATION_MAP[choice])
+        assert duration_seconds is not None
+
+    duration_display = format_duration(duration_seconds)
+    domains = profile.resolve_domains()
+    apps = profile.resolve_apps()
+
+    # Summary + warning
+    show_summary_panel(
+        "Session Summary",
+        [
+            f"Profile:   [bold]{profile_name}[/bold]",
+            f"Duration:  [bold yellow]{duration_display}[/bold yellow]",
+            f"Blocking:  [cyan]{len(domains)}[/cyan] domains, [cyan]{len(apps)}[/cyan] apps",
+        ],
+        border="yellow",
+    )
+    print_warning("Once started, this session CANNOT be stopped until the timer expires.")
+
+    if not prompt_confirm("Start session?"):
+        print_info("Cancelled.")
+        return
+
+    # Need root — re-exec with sudo
+    if os.geteuid() != 0:
+        print_info("Requesting administrator privileges...")
+        python = sys.executable
+        os.execvp("sudo", [
+            "sudo", python, "-m", "lockin.cli",
+            "--start-session", profile_name,
+            "--duration", DURATION_MAP.get(choice, raw if choice == "5" else "1h"),
+        ])
+        # execvp does not return
+    else:
+        _do_start_session(profile_name, duration_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Flow: Manage Profiles
+# ---------------------------------------------------------------------------
+
+PROFILE_MENU = [
+    ("1", "Create a new profile"),
+    ("2", "View all profiles"),
+    ("3", "View profile details"),
+    ("4", "Edit a profile"),
+    ("5", "Delete a profile"),
+    ("0", "Back"),
+]
+
+
+def _flow_manage_profiles() -> None:
+    while True:
+        choice = show_menu("Manage Profiles", PROFILE_MENU)
+        if choice == "0":
+            return
+        elif choice == "1":
+            _flow_create_profile()
+        elif choice == "2":
+            config = load_config()
+            show_profiles(config.profiles)
+        elif choice == "3":
+            _flow_view_profile()
+        elif choice == "4":
+            _flow_edit_profile()
+        elif choice == "5":
+            _flow_delete_profile()
+
+
+def _flow_create_profile() -> None:
+    """Guided profile creation."""
+    config = load_config()
+
+    name = prompt_text("Profile name")
+    if not name:
+        print_error("Name cannot be empty.")
+        return
+    if name in config.profiles:
+        print_error(f"Profile '{name}' already exists.")
+        return
+
+    # Pick presets
+    preset_names = list(PRESETS.keys())
+    show_numbered_list("Available presets", [
+        f"{n}  \u2014  {PRESETS[n].description}" for n in preset_names
+    ])
+    picked_nums = prompt_pick_numbers("Select presets", len(preset_names))
+    chosen_presets = [preset_names[i - 1] for i in picked_nums]
+
+    # Custom sites
+    custom_sites: list[str] = []
+    if prompt_confirm("Add custom sites to block?"):
+        console.print("[dim]Enter domains one at a time. Empty line to finish.[/dim]")
+        while True:
+            domain = prompt_text("Domain (or Enter to finish)", default="")
+            if not domain:
+                break
+            custom_sites.append(domain)
+
+    # Block apps
+    blocked_apps: list[str] = []
+    if prompt_confirm("Block any macOS apps?"):
+        installed = list_installed_apps()
+        if installed:
+            show_numbered_list("Installed apps", installed)
+            app_nums = prompt_pick_numbers("Select apps to block", len(installed))
+            blocked_apps = [installed[i - 1] for i in app_nums]
+        else:
+            print_warning("No apps detected in /Applications.")
+
+    # Summary
+    show_summary_panel(
+        f"New Profile: {name}",
+        [
+            f"Presets:      [green]{', '.join(chosen_presets) or 'none'}[/green]",
+            f"Custom Sites: [white]{', '.join(custom_sites) or 'none'}[/white]",
+            f"Blocked Apps: [yellow]{', '.join(blocked_apps) or 'none'}[/yellow]",
+        ],
+    )
+
+    if not prompt_confirm("Save this profile?", default=True):
+        print_info("Cancelled.")
+        return
+
+    profile = Profile(
+        name=name,
+        presets=chosen_presets,
+        custom_sites=custom_sites,
+        blocked_apps=blocked_apps,
+    )
+    config.profiles[name] = profile
+    save_config(config)
+    print_success(f"Profile '{name}' created.")
+
+
+def _flow_view_profile() -> None:
+    config = load_config()
+    if not config.profiles:
+        print_warning("No profiles to show.")
+        return
+    names = list(config.profiles.keys())
+    show_numbered_list("Profiles", names)
+    nums = prompt_pick_numbers("Profile number", len(names))
+    if not nums:
+        return
+    show_profile_detail(config.profiles[names[nums[0] - 1]])
+
+
+def _flow_edit_profile() -> None:
+    config = load_config()
+    if not config.profiles:
+        print_warning("No profiles to edit.")
+        return
+    names = list(config.profiles.keys())
+    show_numbered_list("Profiles", names)
+    nums = prompt_pick_numbers("Profile number to edit", len(names))
+    if not nums:
+        return
+
+    profile = config.profiles[names[nums[0] - 1]]
+    show_profile_detail(profile)
+
+    edit_menu = [
+        ("1", "Add presets"),
+        ("2", "Remove presets"),
+        ("3", "Add custom sites"),
+        ("4", "Remove custom sites"),
+        ("5", "Add blocked apps"),
+        ("6", "Remove blocked apps"),
+        ("0", "Done editing"),
+    ]
+
+    while True:
+        choice = show_menu(f"Edit Profile: {profile.name}", edit_menu)
+        if choice == "0":
+            break
+        elif choice == "1":
+            available = [p for p in PRESETS if p not in profile.presets]
+            if not available:
+                print_info("All presets already added.")
+                continue
+            show_numbered_list("Available presets", available)
+            picked = prompt_pick_numbers("Select presets to add", len(available))
+            for i in picked:
+                profile.presets.append(available[i - 1])
+                print_success(f"Added preset '{available[i - 1]}'.")
+        elif choice == "2":
+            if not profile.presets:
+                print_info("No presets to remove.")
+                continue
+            show_numbered_list("Current presets", profile.presets)
+            picked = prompt_pick_numbers("Select presets to remove", len(profile.presets))
+            to_remove = [profile.presets[i - 1] for i in picked]
+            for p in to_remove:
+                profile.presets.remove(p)
+                print_success(f"Removed preset '{p}'.")
+        elif choice == "3":
+            console.print("[dim]Enter domains one at a time. Empty line to finish.[/dim]")
+            while True:
+                domain = prompt_text("Domain (or Enter to finish)", default="")
+                if not domain:
+                    break
+                if domain not in profile.custom_sites:
+                    profile.custom_sites.append(domain)
+                    print_success(f"Added site '{domain}'.")
+                else:
+                    print_warning(f"Site '{domain}' already in profile.")
+        elif choice == "4":
+            if not profile.custom_sites:
+                print_info("No custom sites to remove.")
+                continue
+            show_numbered_list("Custom sites", profile.custom_sites)
+            picked = prompt_pick_numbers("Select sites to remove", len(profile.custom_sites))
+            to_remove = [profile.custom_sites[i - 1] for i in picked]
+            for s in to_remove:
+                profile.custom_sites.remove(s)
+                print_success(f"Removed site '{s}'.")
+        elif choice == "5":
+            installed = list_installed_apps()
+            if not installed:
+                print_warning("No apps detected.")
+                continue
+            show_numbered_list("Installed apps", installed)
+            picked = prompt_pick_numbers("Select apps to block", len(installed))
+            for i in picked:
+                app = installed[i - 1]
+                if app not in profile.blocked_apps:
+                    profile.blocked_apps.append(app)
+                    print_success(f"Added app '{app}'.")
+                else:
+                    print_warning(f"App '{app}' already blocked.")
+        elif choice == "6":
+            if not profile.blocked_apps:
+                print_info("No blocked apps to remove.")
+                continue
+            show_numbered_list("Blocked apps", profile.blocked_apps)
+            picked = prompt_pick_numbers("Select apps to unblock", len(profile.blocked_apps))
+            to_remove = [profile.blocked_apps[i - 1] for i in picked]
+            for a in to_remove:
+                profile.blocked_apps.remove(a)
+                print_success(f"Removed app '{a}'.")
+
+    save_config(config)
+    print_success(f"Profile '{profile.name}' updated.")
+    show_profile_detail(profile)
+
+
+def _flow_delete_profile() -> None:
+    config = load_config()
+    if not config.profiles:
+        print_warning("No profiles to delete.")
+        return
+
+    # Block deletion if profile is in use
+    active = get_active_session()
+
+    names = list(config.profiles.keys())
+    show_numbered_list("Profiles", names)
+    nums = prompt_pick_numbers("Profile number to delete", len(names))
+    if not nums:
+        return
+    name = names[nums[0] - 1]
+
+    if active and active.profile_name == name:
+        print_error(f"Cannot delete profile '{name}' \u2014 it's in use by the active session.")
+        return
+
+    if not prompt_confirm(f"Delete profile '{name}'?"):
+        print_info("Cancelled.")
+        return
+
+    del config.profiles[name]
+    save_config(config)
+    print_success(f"Profile '{name}' deleted.")
+
+
+# ---------------------------------------------------------------------------
+# Flow: Manage Schedules
+# ---------------------------------------------------------------------------
+
+SCHEDULE_MENU = [
+    ("1", "Create a new schedule"),
+    ("2", "View all schedules"),
+    ("3", "Delete a schedule"),
+    ("0", "Back"),
+]
+
+DAY_MAP = {
+    "mon": "Monday", "tue": "Tuesday", "wed": "Wednesday",
+    "thu": "Thursday", "fri": "Friday", "sat": "Saturday", "sun": "Sunday",
+}
+
+DAY_NAMES = list(DAY_MAP.keys())
+
+
+def _flow_manage_schedules() -> None:
+    while True:
+        choice = show_menu("Manage Schedules", SCHEDULE_MENU)
+        if choice == "0":
+            return
+        elif choice == "1":
+            _flow_create_schedule()
+        elif choice == "2":
+            config = load_config()
+            show_schedules(config.schedules)
+        elif choice == "3":
+            _flow_delete_schedule()
+
+
+def _flow_create_schedule() -> None:
+    config = load_config()
+
+    if not config.profiles:
+        print_warning("Create a profile first before setting up a schedule.")
+        return
+
+    name = prompt_text("Schedule name")
+    if not name:
+        print_error("Name cannot be empty.")
+        return
+    if name in config.schedules:
+        print_error(f"Schedule '{name}' already exists.")
+        return
+
+    # Pick profile
+    profile_names = list(config.profiles.keys())
+    show_numbered_list("Profiles", profile_names)
+    nums = prompt_pick_numbers("Profile number", len(profile_names))
+    if not nums:
+        return
+    profile_name = profile_names[nums[0] - 1]
+
+    # Pick days
+    show_numbered_list("Days of the week", [
+        f"{short} ({full})" for short, full in DAY_MAP.items()
+    ])
+    day_nums = prompt_pick_numbers("Select days", len(DAY_NAMES))
+    if not day_nums:
+        print_error("Must select at least one day.")
+        return
+    day_list = [list(DAY_MAP.values())[i - 1] for i in day_nums]
+
+    # Start time
+    start_time = prompt_text("Start time (HH:MM)", default="09:00")
+
+    # Duration
+    dur_str = prompt_text("Duration (e.g. 2h, 90m)", default="2h")
+    dur_seconds = _parse_duration(dur_str)
+    if dur_seconds is None:
+        print_error(f"Invalid duration '{dur_str}'.")
+        return
+    duration_minutes = dur_seconds // 60
+
+    schedule = Schedule(
+        name=name,
+        profile=profile_name,
+        days=day_list,
+        start_time=start_time,
+        duration_minutes=duration_minutes,
+    )
+    config.schedules[name] = schedule
+    save_config(config)
+    print_success(f"Schedule '{name}' created.")
+
+
+def _flow_delete_schedule() -> None:
+    config = load_config()
+    if not config.schedules:
+        print_warning("No schedules to delete.")
+        return
+
+    names = list(config.schedules.keys())
+    show_numbered_list("Schedules", names)
+    nums = prompt_pick_numbers("Schedule number to delete", len(names))
+    if not nums:
+        return
+    name = names[nums[0] - 1]
+
+    if not prompt_confirm(f"Delete schedule '{name}'?"):
+        print_info("Cancelled.")
+        return
+
+    del config.schedules[name]
+    save_config(config)
+    print_success(f"Schedule '{name}' deleted.")
+
+
+# ---------------------------------------------------------------------------
+# Flow: Always-Blocked Sites
+# ---------------------------------------------------------------------------
+
+ALWAYS_BLOCKED_MENU = [
+    ("1", "View always-blocked list"),
+    ("2", "Add a domain"),
+    ("3", "Remove a domain"),
+    ("0", "Back"),
+]
+
+
+def _flow_always_blocked() -> None:
+    while True:
+        choice = show_menu("Always-Blocked Sites", ALWAYS_BLOCKED_MENU)
+        if choice == "0":
+            return
+        elif choice == "1":
+            config = load_config()
+            show_always_blocked(config.always_blocked.sites, config.always_blocked.apps)
+        elif choice == "2":
+            domain = prompt_text("Domain to always block")
+            if not domain:
+                continue
+            config = load_config()
+            if domain in config.always_blocked.sites:
+                print_warning(f"'{domain}' is already in the always-blocked list.")
+            else:
+                config.always_blocked.sites.append(domain)
+                save_config(config)
+                print_success(f"Added '{domain}' to always-blocked list.")
+        elif choice == "3":
+            config = load_config()
+            if not config.always_blocked.sites:
+                print_warning("No always-blocked sites to remove.")
+                continue
+            show_numbered_list("Always-blocked sites", config.always_blocked.sites)
+            nums = prompt_pick_numbers("Site number to remove", len(config.always_blocked.sites))
+            if not nums:
+                continue
+            domain = config.always_blocked.sites[nums[0] - 1]
+            config.always_blocked.sites.remove(domain)
+            save_config(config)
+            print_success(f"Removed '{domain}' from always-blocked list.")
+
+
+# ---------------------------------------------------------------------------
+# Flow: View Presets
+# ---------------------------------------------------------------------------
+
+def _flow_view_presets() -> None:
+    show_presets(list_presets())
+
+
+# ---------------------------------------------------------------------------
+# Flow: Settings & Info
+# ---------------------------------------------------------------------------
+
+SETTINGS_MENU = [
+    ("1", "Check daemon status"),
+    ("2", "Install daemon"),
+    ("3", "Uninstall daemon"),
+    ("4", "List installed apps"),
+    ("5", "Show version"),
+    ("0", "Back"),
+]
+
+
+def _flow_settings() -> None:
+    while True:
+        choice = show_menu("Settings & Info", SETTINGS_MENU)
+        if choice == "0":
+            return
+        elif choice == "1":
+            if is_daemon_installed():
+                print_success("Watchdog daemon is installed.")
+            else:
+                print_warning("Watchdog daemon is NOT installed.")
+        elif choice == "2":
+            if os.geteuid() != 0:
+                print_error("Installing the daemon requires root. Run: sudo lockin")
+                continue
+            if install_daemon():
+                print_success("Watchdog daemon installed and loaded.")
+            else:
+                print_error("Failed to install the watchdog daemon.")
+        elif choice == "3":
+            if os.geteuid() != 0:
+                print_error("Uninstalling the daemon requires root. Run: sudo lockin")
+                continue
+            active = get_active_session()
+            if active:
+                print_error("Cannot uninstall while a focus session is active.")
+                continue
+            if uninstall_daemon():
+                print_success("Watchdog daemon uninstalled.")
+            else:
+                print_error("Failed to uninstall the watchdog daemon.")
+        elif choice == "4":
+            installed = list_installed_apps()
+            from lockin.ui import show_apps
+
+            show_apps(installed)
+        elif choice == "5":
+            console.print(f"lockin v{__version__}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Entry point for the ``lockin`` command."""
+    # Handle CLI shortcuts first
+    if _handle_argv():
+        return
+
+    # If there's an active session, jump straight to live countdown
+    session = load_session()
+    if session and session.verify() and not session.is_expired:
+        live_countdown(session)
+        return
+
+    # Otherwise, show the interactive menu
+    try:
+        _main_menu()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Goodbye![/dim]")
+    except EOFError:
+        console.print("\n[dim]Goodbye![/dim]")
+
+
+if __name__ == "__main__":
+    main()
