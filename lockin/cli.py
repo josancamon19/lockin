@@ -800,13 +800,12 @@ def main() -> None:
     if _handle_argv():
         return
 
-    # If there's an active session, jump straight to live countdown
+    # If there's an active session, show live countdown first
     session = load_session()
     if session and session.verify() and not session.is_expired:
         live_countdown(session)
-        return
 
-    # Otherwise, show the interactive menu
+    # Then show the interactive menu
     try:
         _main_menu()
     except KeyboardInterrupt:
