@@ -1,9 +1,10 @@
 # Lockin — Development Notes
 
 ## After every code change
-Always push and reinstall so the running menubar app picks up changes:
+Always push and reinstall so the global `lockin` / `lockin-menubar` picks up changes.
+The user has lockin installed globally via **pipx**, not just the local .venv:
 ```bash
-git add -A && git commit -m "..." && git push && uv pip install -e .
+git add -A && git commit -m "..." && git push && pipx install --force /Users/joancabezas/Downloads/projects/lockin
 ```
 
 ## Project structure
