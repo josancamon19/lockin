@@ -91,7 +91,6 @@ _BROWSER_NAME_PATTERNS: set[str] = {
     "opera",
     "vivaldi",
     "arc",
-    "atlas",
     "orion",
     "chromium",
     "sigmaos",
@@ -99,6 +98,11 @@ _BROWSER_NAME_PATTERNS: set[str] = {
     "waterfox",
     "tor browser",
     "duckduckgo",
+}
+
+# Apps that match browser name patterns but are NOT browsers
+_NON_BROWSER_BUNDLE_IDS: set[str] = {
+    "com.openai.atlas",  # ChatGPT desktop app
 }
 
 # Apps to ignore (screen locked / screensaver)
@@ -154,6 +158,8 @@ def get_window_title(pid: int) -> str | None:
 
 def is_browser(bundle_id: str | None, app_name: str | None) -> bool:
     """Check if the given app is a web browser."""
+    if bundle_id and bundle_id.lower() in _NON_BROWSER_BUNDLE_IDS:
+        return False
     if bundle_id and bundle_id.lower() in _BROWSER_BUNDLE_IDS:
         return True
     if app_name:
