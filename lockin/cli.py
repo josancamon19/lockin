@@ -828,7 +828,15 @@ def _flow_activity_recap() -> None:
 
 def _build_settings_menu() -> list[tuple[str, str]]:
     granted = _check_accessibility()
-    status = "[green]ON[/green]" if granted else "[red]OFF[/red]"
+    ax_status = "[green]ON[/green]" if granted else "[red]OFF[/red]"
+
+    config = load_config()
+    ss = config.screenshot_settings
+    if ss.enabled:
+        ss_label = f"[green]ON[/green] every {ss.interval_seconds}s, keep {ss.retention_days}d"
+    else:
+        ss_label = "[red]OFF[/red]"
+
     return [
         ("1", "Check daemon status"),
         ("2", "Install daemon"),
@@ -838,7 +846,8 @@ def _build_settings_menu() -> list[tuple[str, str]]:
         ("6", "Launch menu bar app"),
         ("7", "Install menu bar auto-start"),
         ("8", "Uninstall menu bar auto-start"),
-        ("9", f"Accessibility permission [{status}]  \u2014  needed for URL tracking"),
+        ("9", f"Accessibility permission [{ax_status}]  \u2014  needed for URL tracking"),
+        ("s", f"Screenshot capture [{ss_label}]"),
         ("0", "Back"),
     ]
 
@@ -960,6 +969,116 @@ def _flow_grant_accessibility() -> None:
     )
 
 
+def _flow_screenshot_settings() -> None:
+    """Configure periodic screenshot capture."""
+    config = load_config()
+    ss = config.screenshot_settings
+
+    status = "[green]ON[/green]" if ss.enabled else "[red]OFF[/red]"
+    show_summary_panel(
+        "Screenshot Capture",
+        [
+            f"Status:    {status}",
+            f"Interval:  [bold]{ss.interval_seconds}s[/bold]",
+            f"Retention: [bold]{ss.retention_days} days[/bold]",
+        ],
+    )
+
+    # Show storage usage
+    from lockin.tracker import SCREENSHOTS_DIR
+
+    if SCREENSHOTS_DIR.exists():
+        total_size = 0
+        file_count = 0
+        for f in SCREENSHOTS_DIR.rglob("*.jpg"):
+            total_size += f.stat().st_size
+            file_count += 1
+        if file_count > 0:
+            if total_size >= 1024 * 1024:
+                size_str = f"{total_size / (1024 * 1024):.1f} MB"
+            else:
+                size_str = f"{total_size / 1024:.0f} KB"
+            print_info(f"Storage: {file_count} screenshots, {size_str}")
+
+    menu = [
+        ("1", "Enable" if not ss.enabled else "Disable"),
+        ("2", "Set interval"),
+        ("3", "Set retention"),
+        ("0", "Back"),
+    ]
+
+    while True:
+        choice = show_menu("Screenshot Settings", menu)
+        if choice == "0":
+            return
+        elif choice == "1":
+            ss.enabled = not ss.enabled
+            config.screenshot_settings = ss
+            save_config(config)
+            state = "enabled" if ss.enabled else "disabled"
+            print_success(f"Screenshot capture {state}.")
+            menu[0] = ("1", "Enable" if not ss.enabled else "Disable")
+        elif choice == "2":
+            interval_menu = [
+                ("1", "30 seconds"),
+                ("2", "1 minute"),
+                ("3", "2 minutes"),
+                ("4", "5 minutes"),
+                ("5", "Custom"),
+                ("0", "Back"),
+            ]
+            ic = show_menu("Capture Interval", interval_menu)
+            interval_map = {"1": 30, "2": 60, "3": 120, "4": 300}
+            if ic in interval_map:
+                ss.interval_seconds = interval_map[ic]
+            elif ic == "5":
+                raw = prompt_text("Interval in seconds (10-600)")
+                try:
+                    val = int(raw)
+                    if 10 <= val <= 600:
+                        ss.interval_seconds = val
+                    else:
+                        print_error("Must be between 10 and 600 seconds.")
+                        continue
+                except ValueError:
+                    print_error("Invalid number.")
+                    continue
+            else:
+                continue
+            config.screenshot_settings = ss
+            save_config(config)
+            print_success(f"Interval set to {ss.interval_seconds}s.")
+        elif choice == "3":
+            retention_menu = [
+                ("1", "7 days"),
+                ("2", "14 days"),
+                ("3", "30 days"),
+                ("4", "Custom"),
+                ("0", "Back"),
+            ]
+            rc = show_menu("Retention Period", retention_menu)
+            retention_map = {"1": 7, "2": 14, "3": 30}
+            if rc in retention_map:
+                ss.retention_days = retention_map[rc]
+            elif rc == "4":
+                raw = prompt_text("Retention in days (1-365)")
+                try:
+                    val = int(raw)
+                    if 1 <= val <= 365:
+                        ss.retention_days = val
+                    else:
+                        print_error("Must be between 1 and 365 days.")
+                        continue
+                except ValueError:
+                    print_error("Invalid number.")
+                    continue
+            else:
+                continue
+            config.screenshot_settings = ss
+            save_config(config)
+            print_success(f"Retention set to {ss.retention_days} days.")
+
+
 def _flow_settings() -> None:
     while True:
         choice = show_menu("Settings & Info", _build_settings_menu())
@@ -1022,6 +1141,8 @@ def _flow_settings() -> None:
                 print_error("Failed to remove menu bar auto-start.")
         elif choice == "9":
             _flow_grant_accessibility()
+        elif choice == "s":
+            _flow_screenshot_settings()
 
 
 # ---------------------------------------------------------------------------

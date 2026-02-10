@@ -150,15 +150,18 @@ def show_schedules(schedules: dict[str, Schedule]) -> None:
     table.add_column("Days", style="white")
     table.add_column("Start", style="yellow")
     table.add_column("Duration", style="magenta")
+    table.add_column("Timezone", style="dim")
 
     for name, schedule in schedules.items():
         days_str = ", ".join(schedule.days)
+        tz_display = schedule.timezone if schedule.timezone else "system"
         table.add_row(
             name,
             schedule.profile,
             days_str,
             schedule.start_time,
             f"{schedule.duration_minutes}m",
+            tz_display,
         )
 
     console.print(table)

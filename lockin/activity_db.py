@@ -23,8 +23,21 @@ CREATE TABLE IF NOT EXISTS activity_log (
 );
 """
 
+_CREATE_SCREENSHOTS_TABLE = """
+CREATE TABLE IF NOT EXISTS screenshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    activity_id INTEGER,
+    taken_at    TEXT NOT NULL,
+    file_path   TEXT NOT NULL
+);
+"""
+
 _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_activity_started ON activity_log(started_at);
+"""
+
+_CREATE_SCREENSHOTS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_screenshots_taken ON screenshots(taken_at);
 """
 
 
@@ -41,7 +54,9 @@ def init_db() -> None:
     conn = _connect()
     try:
         conn.execute(_CREATE_TABLE)
+        conn.execute(_CREATE_SCREENSHOTS_TABLE)
         conn.execute(_CREATE_INDEX)
+        conn.execute(_CREATE_SCREENSHOTS_INDEX)
         conn.commit()
     finally:
         conn.close()
@@ -191,6 +206,54 @@ def query_weekly_summary(start: date, end: date) -> list[dict]:
                GROUP BY day, category
                ORDER BY day, category""",
             (range_end, range_start, datetime.now().isoformat(), range_start, range_end, range_start),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# -- Screenshot functions --
+
+
+def insert_screenshot(activity_id: int | None, taken_at: str, file_path: str) -> int:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO screenshots (activity_id, taken_at, file_path) VALUES (?, ?, ?)",
+            (activity_id, taken_at, file_path),
+        )
+        conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+    finally:
+        conn.close()
+
+
+def delete_screenshots_before(cutoff_iso: str) -> list[str]:
+    """Delete screenshot rows older than cutoff. Returns file_paths of deleted rows."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT file_path FROM screenshots WHERE taken_at < ?",
+            (cutoff_iso,),
+        ).fetchall()
+        paths = [r["file_path"] for r in rows]
+        if paths:
+            conn.execute("DELETE FROM screenshots WHERE taken_at < ?", (cutoff_iso,))
+            conn.commit()
+        return paths
+    finally:
+        conn.close()
+
+
+def query_screenshots_for_date(target_date: date) -> list[dict]:
+    day_start = datetime(target_date.year, target_date.month, target_date.day).isoformat()
+    day_end = (datetime(target_date.year, target_date.month, target_date.day) + timedelta(days=1)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM screenshots WHERE taken_at >= ? AND taken_at < ? ORDER BY taken_at",
+            (day_start, day_end),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:

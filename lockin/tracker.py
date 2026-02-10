@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+import shutil
+from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 
-from lockin.activity_db import close_activity, init_db, insert_activity
+from lockin.activity_db import (
+    close_activity,
+    delete_screenshots_before,
+    init_db,
+    insert_activity,
+    insert_screenshot,
+)
 from lockin.categorizer import categorize
+from lockin.config import CONFIG_DIR, ScreenshotSettings, load_config
+
+SCREENSHOTS_DIR = CONFIG_DIR / "screenshots"
 
 # -- macOS framework imports (lazy, so module can be imported on any platform) --
 
@@ -283,6 +294,39 @@ def request_accessibility_permission() -> bool:
         return False
 
 
+def capture_screenshot(directory: Path) -> Path | None:
+    """Capture the main display as a JPEG file. Returns the path or None on failure."""
+    _ensure_imports()
+    if _CG is None:
+        return None
+    try:
+        display_id = _CG.CGMainDisplayID()
+        image = _CG.CGDisplayCreateImage(display_id)
+        if image is None:
+            return None
+
+        now = datetime.now()
+        date_dir = directory / now.strftime("%Y-%m-%d")
+        date_dir.mkdir(parents=True, exist_ok=True)
+        file_path = date_dir / now.strftime("%H-%M-%S.jpg")
+
+        url = _CG.CFURLCreateWithFileSystemPath(
+            None, str(file_path), _CG.kCFURLPOSIXPathStyle, False
+        )
+        dest = _CG.CGImageDestinationCreateWithURL(url, "public.jpeg", 1, None)
+        if dest is None:
+            return None
+
+        properties = {_CG.kCGImageDestinationLossyCompressionQuality: 0.5}
+        _CG.CGImageDestinationAddImage(dest, image, properties)
+        if not _CG.CGImageDestinationFinalize(dest):
+            return None
+
+        return file_path
+    except Exception:
+        return None
+
+
 class ActivityTracker:
     """Tracks frontmost app activity, writing to SQLite on state changes."""
 
@@ -293,8 +337,32 @@ class ActivityTracker:
         self._current_domain: str | None = None
         self._current_bundle: str | None = None
 
+        # Screenshot state
+        cfg = load_config()
+        self._screenshot_settings: ScreenshotSettings = cfg.screenshot_settings
+        self._screenshot_tick: int = 0
+
+        # Cleanup old screenshots on startup
+        try:
+            self._cleanup_old_screenshots()
+        except Exception:
+            pass
+
     def poll(self) -> None:
         """Called every tick. Detects state changes and writes to DB."""
+        # Screenshot capture
+        if self._screenshot_settings.enabled:
+            self._screenshot_tick += 1
+            if self._screenshot_tick >= self._screenshot_settings.interval_seconds:
+                self._screenshot_tick = 0
+                try:
+                    path = capture_screenshot(SCREENSHOTS_DIR)
+                    if path is not None:
+                        now = datetime.now().isoformat()
+                        insert_screenshot(self._current_row_id, now, str(path))
+                except Exception:
+                    pass
+
         app_name, bundle_id, pid = get_frontmost_app()
 
         if app_name is None:
@@ -353,6 +421,37 @@ class ActivityTracker:
             self._current_app = None
             self._current_domain = None
             self._current_bundle = None
+
+    def reload_screenshot_settings(self) -> None:
+        """Reload screenshot settings from config (e.g. after user changes them)."""
+        cfg = load_config()
+        self._screenshot_settings = cfg.screenshot_settings
+        self._screenshot_tick = 0
+
+    def _cleanup_old_screenshots(self) -> None:
+        """Delete screenshots older than retention_days from DB and disk."""
+        retention = self._screenshot_settings.retention_days
+        cutoff = datetime.now() - timedelta(days=retention)
+        cutoff_iso = cutoff.isoformat()
+
+        file_paths = delete_screenshots_before(cutoff_iso)
+        for fp in file_paths:
+            try:
+                p = Path(fp)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+        # Remove empty date directories
+        if SCREENSHOTS_DIR.exists():
+            for date_dir in SCREENSHOTS_DIR.iterdir():
+                if date_dir.is_dir():
+                    try:
+                        if not any(date_dir.iterdir()):
+                            date_dir.rmdir()
+                    except Exception:
+                        pass
 
     def shutdown(self) -> None:
         """Close the current activity row on app quit."""
