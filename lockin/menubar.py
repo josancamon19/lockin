@@ -17,9 +17,21 @@ class LockinMenuBar(rumps.App):
 
     def __init__(self):
         super().__init__("Lockin", title="LI", quit_button=None)
+
+        # Initialize activity tracker
+        self._tracker = None
+        try:
+            from lockin.tracker import ActivityTracker, request_accessibility_permission
+
+            request_accessibility_permission()
+            self._tracker = ActivityTracker()
+        except Exception:
+            pass  # Tracker must never prevent menubar from starting
+
         self.menu = [
             rumps.MenuItem("No active session", callback=None),
             None,  # separator
+            rumps.MenuItem("Today's Recap", callback=self._show_recap),
             rumps.MenuItem("Quit", callback=self._quit),
         ]
         self.timer = rumps.Timer(self._tick, POLL_INTERVAL)
@@ -27,6 +39,13 @@ class LockinMenuBar(rumps.App):
 
     def _tick(self, _sender):
         """Poll session state and update the menu bar."""
+        # Activity tracking — must never crash the menubar
+        if self._tracker is not None:
+            try:
+                self._tracker.poll()
+            except Exception:
+                pass
+
         session = get_active_session()
 
         if session is None:
@@ -35,6 +54,7 @@ class LockinMenuBar(rumps.App):
             self.menu = [
                 rumps.MenuItem("No active session", callback=None),
                 None,
+                rumps.MenuItem("Today's Recap", callback=self._show_recap),
                 rumps.MenuItem("Quit", callback=self._quit),
             ]
             return
@@ -56,10 +76,34 @@ class LockinMenuBar(rumps.App):
             rumps.MenuItem(f"Progress: {percent}%", callback=None),
             rumps.MenuItem(f"Blocking: {domains_count} domains, {apps_count} apps", callback=None),
             None,
+            rumps.MenuItem("Today's Recap", callback=self._show_recap),
             rumps.MenuItem("Quit", callback=self._quit),
         ]
 
+    def _show_recap(self, _sender):
+        """Show a notification with today's quick summary."""
+        try:
+            from lockin.recap import get_quick_summary
+
+            summary = get_quick_summary()
+            rumps.notification(
+                title="Lockin - Today's Recap",
+                subtitle="",
+                message=summary,
+            )
+        except Exception:
+            rumps.notification(
+                title="Lockin",
+                subtitle="",
+                message="Could not load activity data.",
+            )
+
     def _quit(self, _sender):
+        if self._tracker is not None:
+            try:
+                self._tracker.shutdown()
+            except Exception:
+                pass
         rumps.quit_application()
 
 

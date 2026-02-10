@@ -1,0 +1,197 @@
+"""SQLite storage for activity tracking (~/.config/lockin/activity.db)."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+DB_PATH = Path.home() / ".config" / "lockin" / "activity.db"
+
+_CREATE_TABLE = """
+CREATE TABLE IF NOT EXISTS activity_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at   TEXT NOT NULL,
+    ended_at     TEXT,
+    app_name     TEXT NOT NULL,
+    bundle_id    TEXT,
+    window_title TEXT,
+    url          TEXT,
+    domain       TEXT,
+    category     TEXT NOT NULL DEFAULT 'neutral',
+    preset_match TEXT
+);
+"""
+
+_CREATE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_activity_started ON activity_log(started_at);
+"""
+
+
+def _connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = _connect()
+    try:
+        conn.execute(_CREATE_TABLE)
+        conn.execute(_CREATE_INDEX)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_activity(
+    started_at: str,
+    app_name: str,
+    bundle_id: str | None,
+    window_title: str | None,
+    url: str | None,
+    domain: str | None,
+    category: str,
+    preset_match: str | None,
+) -> int:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """INSERT INTO activity_log
+               (started_at, app_name, bundle_id, window_title, url, domain, category, preset_match)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (started_at, app_name, bundle_id, window_title, url, domain, category, preset_match),
+        )
+        conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+    finally:
+        conn.close()
+
+
+def close_activity(row_id: int, ended_at: str) -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE activity_log SET ended_at = ? WHERE id = ?",
+            (ended_at, row_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def query_daily_summary(target_date: date) -> list[dict]:
+    """Return rows for a given date, ordered by started_at.
+
+    Each row has: app_name, domain, category, preset_match, total_seconds.
+    Groups by (app_name, domain, category) and sums duration.
+    """
+    day_start = datetime(target_date.year, target_date.month, target_date.day).isoformat()
+    day_end = (datetime(target_date.year, target_date.month, target_date.day) + timedelta(days=1)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT app_name, domain, category, preset_match,
+                      SUM(
+                          CASE WHEN ended_at IS NOT NULL
+                               THEN MAX(0, julianday(MIN(ended_at, ?)) - julianday(MAX(started_at, ?))) * 86400
+                               ELSE MAX(0, julianday(?) - julianday(MAX(started_at, ?))) * 86400
+                          END
+                      ) as total_seconds
+               FROM activity_log
+               WHERE started_at < ? AND (ended_at > ? OR ended_at IS NULL)
+               GROUP BY app_name, domain, category
+               ORDER BY total_seconds DESC""",
+            (day_end, day_start, datetime.now().isoformat(), day_start, day_end, day_start),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def query_top_apps(target_date: date, limit: int = 10) -> list[dict]:
+    """Top apps by total time for a given date."""
+    day_start = datetime(target_date.year, target_date.month, target_date.day).isoformat()
+    day_end = (datetime(target_date.year, target_date.month, target_date.day) + timedelta(days=1)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT app_name, category,
+                      SUM(
+                          CASE WHEN ended_at IS NOT NULL
+                               THEN MAX(0, julianday(MIN(ended_at, ?)) - julianday(MAX(started_at, ?))) * 86400
+                               ELSE MAX(0, julianday(?) - julianday(MAX(started_at, ?))) * 86400
+                          END
+                      ) as total_seconds
+               FROM activity_log
+               WHERE started_at < ? AND (ended_at > ? OR ended_at IS NULL)
+               GROUP BY app_name
+               ORDER BY total_seconds DESC
+               LIMIT ?""",
+            (day_end, day_start, datetime.now().isoformat(), day_start, day_end, day_start, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def query_top_domains(target_date: date, limit: int = 10) -> list[dict]:
+    """Top domains by total time for a given date (excludes NULL domains)."""
+    day_start = datetime(target_date.year, target_date.month, target_date.day).isoformat()
+    day_end = (datetime(target_date.year, target_date.month, target_date.day) + timedelta(days=1)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT domain, category,
+                      SUM(
+                          CASE WHEN ended_at IS NOT NULL
+                               THEN MAX(0, julianday(MIN(ended_at, ?)) - julianday(MAX(started_at, ?))) * 86400
+                               ELSE MAX(0, julianday(?) - julianday(MAX(started_at, ?))) * 86400
+                          END
+                      ) as total_seconds
+               FROM activity_log
+               WHERE started_at < ? AND (ended_at > ? OR ended_at IS NULL)
+                     AND domain IS NOT NULL
+               GROUP BY domain
+               ORDER BY total_seconds DESC
+               LIMIT ?""",
+            (day_end, day_start, datetime.now().isoformat(), day_start, day_end, day_start, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def query_weekly_summary(start: date, end: date) -> list[dict]:
+    """Per-day category totals for a date range.
+
+    Returns rows with: day, category, total_seconds.
+    """
+    range_start = datetime(start.year, start.month, start.day).isoformat()
+    range_end = (datetime(end.year, end.month, end.day) + timedelta(days=1)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT date(started_at) as day, category,
+                      SUM(
+                          CASE WHEN ended_at IS NOT NULL
+                               THEN MAX(0, julianday(MIN(ended_at, ?)) - julianday(MAX(started_at, ?))) * 86400
+                               ELSE MAX(0, julianday(?) - julianday(MAX(started_at, ?))) * 86400
+                          END
+                      ) as total_seconds
+               FROM activity_log
+               WHERE started_at < ? AND (ended_at > ? OR ended_at IS NULL)
+               GROUP BY day, category
+               ORDER BY day, category""",
+            (range_end, range_start, datetime.now().isoformat(), range_start, range_end, range_start),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()

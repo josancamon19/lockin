@@ -95,12 +95,49 @@ def _handle_argv() -> bool:
         _handle_start_session_shortcut(args[1:])
         return True
 
+    # --recap [daily|weekly] [--date YYYY-MM-DD]
+    if args[0] == "--recap":
+        _handle_recap_shortcut(args[1:])
+        return True
+
     # Unknown flag — print help hint
     print_error(f"Unknown option: {args[0]}")
     console.print("[dim]Usage: lockin              (interactive menu)[/dim]")
     console.print("[dim]       lockin --version    (show version)[/dim]")
     console.print("[dim]       lockin --status     (show session status)[/dim]")
+    console.print("[dim]       lockin --recap      (show activity recap)[/dim]")
     return True
+
+
+def _handle_recap_shortcut(args: list[str]) -> None:
+    """Process ``--recap [daily|weekly] [--date YYYY-MM-DD]``."""
+    from datetime import date, timedelta
+
+    from lockin.recap import show_daily_recap, show_weekly_recap
+
+    mode = "daily"
+    target_date = date.today()
+
+    i = 0
+    while i < len(args):
+        if args[i] in ("daily", "weekly"):
+            mode = args[i]
+            i += 1
+        elif args[i] == "--date" and i + 1 < len(args):
+            try:
+                target_date = date.fromisoformat(args[i + 1])
+            except ValueError:
+                print_error(f"Invalid date '{args[i + 1]}'. Use YYYY-MM-DD format.")
+                return
+            i += 2
+        else:
+            print_error(f"Unknown argument: {args[i]}")
+            return
+
+    if mode == "weekly":
+        show_weekly_recap()
+    else:
+        show_daily_recap(target_date)
 
 
 def _handle_start_session_shortcut(args: list[str]) -> None:
@@ -210,7 +247,8 @@ MAIN_MENU_OPTIONS = [
     ("3", "Manage Schedules       \u2014  create / list / delete"),
     ("4", "Always-Blocked Sites   \u2014  add / remove domains"),
     ("5", "View Presets           \u2014  show built-in categories (read-only)"),
-    ("6", "Settings & Info        \u2014  daemon status, installed apps, version"),
+    ("6", "Activity Recap         \u2014  daily / weekly productivity reports"),
+    ("7", "Settings & Info        \u2014  daemon status, installed apps, version"),
     ("0", "Exit"),
 ]
 
@@ -232,6 +270,8 @@ def _main_menu() -> None:
         elif choice == "5":
             _flow_view_presets()
         elif choice == "6":
+            _flow_activity_recap()
+        elif choice == "7":
             _flow_settings()
         elif choice == "0":
             console.print("[dim]Goodbye![/dim]")
@@ -746,6 +786,43 @@ def _flow_view_presets() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Flow: Activity Recap
+# ---------------------------------------------------------------------------
+
+RECAP_MENU = [
+    ("1", "Today's recap"),
+    ("2", "Yesterday's recap"),
+    ("3", "Pick a date"),
+    ("4", "Weekly summary"),
+    ("0", "Back"),
+]
+
+
+def _flow_activity_recap() -> None:
+    from datetime import date, timedelta
+
+    from lockin.recap import show_daily_recap, show_weekly_recap
+
+    while True:
+        choice = show_menu("Activity Recap", RECAP_MENU)
+        if choice == "0":
+            return
+        elif choice == "1":
+            show_daily_recap(date.today())
+        elif choice == "2":
+            show_daily_recap(date.today() - timedelta(days=1))
+        elif choice == "3":
+            raw = prompt_text("Date (YYYY-MM-DD)")
+            try:
+                target = date.fromisoformat(raw)
+                show_daily_recap(target)
+            except ValueError:
+                print_error(f"Invalid date '{raw}'. Use YYYY-MM-DD format.")
+        elif choice == "4":
+            show_weekly_recap()
+
+
+# ---------------------------------------------------------------------------
 # Flow: Settings & Info
 # ---------------------------------------------------------------------------
 
@@ -758,6 +835,7 @@ SETTINGS_MENU = [
     ("6", "Launch menu bar app"),
     ("7", "Install menu bar auto-start"),
     ("8", "Uninstall menu bar auto-start"),
+    ("9", "Grant Accessibility permission  \u2014  needed for activity tracking"),
     ("0", "Back"),
 ]
 
@@ -828,6 +906,43 @@ def _is_menubar_launch_agent_installed() -> bool:
     return _LAUNCH_AGENT_PLIST.exists()
 
 
+def _flow_grant_accessibility() -> None:
+    """Guide the user through granting Accessibility permission."""
+    # Find the real Python binary that lockin-menubar uses
+    python_bin = sys.executable
+    try:
+        real_path = Path(python_bin).resolve()
+    except OSError:
+        real_path = Path(python_bin)
+
+    print_info("Activity tracking needs Accessibility permission to read browser URLs.")
+    console.print()
+    console.print("  [bold]Steps:[/bold]")
+    console.print("  1. System Settings will open to Accessibility")
+    console.print(f"  2. Click [bold]+[/bold] and press [bold]Cmd+Shift+G[/bold] to type a path")
+    console.print(f"  3. Paste this path and add it:")
+    console.print(f"     [bold cyan]{real_path}[/bold cyan]")
+    console.print("  4. Make sure the toggle is [bold green]ON[/bold green]")
+    console.print("  5. Restart the menu bar app")
+    console.print()
+
+    # Copy path to clipboard
+    try:
+        subprocess.run(
+            ["pbcopy"],
+            input=str(real_path).encode(),
+            check=True,
+        )
+        print_success(f"Path copied to clipboard.")
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+    # Open System Settings
+    subprocess.Popen(
+        ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+    )
+
+
 def _flow_settings() -> None:
     while True:
         choice = show_menu("Settings & Info", SETTINGS_MENU)
@@ -888,6 +1003,8 @@ def _flow_settings() -> None:
                 print_success("Menu bar auto-start removed.")
             else:
                 print_error("Failed to remove menu bar auto-start.")
+        elif choice == "9":
+            _flow_grant_accessibility()
 
 
 # ---------------------------------------------------------------------------
