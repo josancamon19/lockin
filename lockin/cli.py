@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 from lockin import __version__
 from lockin.apps import list_installed_apps
 from lockin.blocker import apply_blocks, remove_blocks
-from lockin.config import Config, Profile, Schedule, load_config, save_config
+from lockin.config import Config, Profile, Schedule, load_config, resolve_blocked_lists, save_config
 from lockin.daemon import install_daemon, is_daemon_installed, uninstall_daemon
-from lockin.presets import PRESETS, SUBDOMAIN_PREFIXES, list_presets
+from lockin.presets import PRESETS, list_presets
 from lockin.session import (
     Session,
     create_session,
@@ -152,18 +155,7 @@ def _do_start_session(profile_name: str, duration_seconds: int) -> None:
         print_error(f"Profile '{profile_name}' not found.")
         sys.exit(1)
 
-    blocked_domains = profile.resolve_domains()
-    blocked_apps = profile.resolve_apps()
-
-    # Add always-blocked items
-    for site in config.always_blocked.sites:
-        for prefix in SUBDOMAIN_PREFIXES:
-            d = f"{prefix}{site}"
-            if d not in blocked_domains:
-                blocked_domains.append(d)
-    for a in config.always_blocked.apps:
-        if a not in blocked_apps:
-            blocked_apps.append(a)
+    blocked_domains, blocked_apps = resolve_blocked_lists(profile, config.always_blocked)
 
     if not blocked_domains and not blocked_apps:
         print_warning("This profile has nothing to block. Add presets or custom sites first.")
@@ -605,6 +597,19 @@ def _flow_manage_schedules() -> None:
             _flow_delete_schedule()
 
 
+def _detect_timezone() -> str:
+    """Detect the system IANA timezone name from /etc/localtime symlink."""
+    try:
+        from pathlib import Path
+
+        link = Path("/etc/localtime").resolve()
+        parts = link.parts
+        idx = parts.index("zoneinfo")
+        return "/".join(parts[idx + 1 :])
+    except (ValueError, OSError):
+        return ""
+
+
 def _flow_create_schedule() -> None:
     config = load_config()
 
@@ -649,16 +654,19 @@ def _flow_create_schedule() -> None:
         return
     duration_minutes = dur_seconds // 60
 
+    tz_name = _detect_timezone()
     schedule = Schedule(
         name=name,
         profile=profile_name,
         days=day_list,
         start_time=start_time,
         duration_minutes=duration_minutes,
+        timezone=tz_name,
     )
     config.schedules[name] = schedule
     save_config(config)
-    print_success(f"Schedule '{name}' created.")
+    tz_display = tz_name or "system default"
+    print_success(f"Schedule '{name}' created (timezone: {tz_display}).")
 
 
 def _flow_delete_schedule() -> None:
@@ -747,8 +755,77 @@ SETTINGS_MENU = [
     ("3", "Uninstall daemon"),
     ("4", "List installed apps"),
     ("5", "Show version"),
+    ("6", "Launch menu bar app"),
+    ("7", "Install menu bar auto-start"),
+    ("8", "Uninstall menu bar auto-start"),
     ("0", "Back"),
 ]
+
+
+_LAUNCH_AGENT_DIR = Path.home() / "Library" / "LaunchAgents"
+_LAUNCH_AGENT_PLIST = _LAUNCH_AGENT_DIR / "com.lockin.menubar.plist"
+_LAUNCH_AGENT_LABEL = "com.lockin.menubar"
+
+
+def _menubar_plist_content() -> str:
+    """Generate the Launch Agent plist XML for the menu bar app."""
+    menubar_bin = shutil.which("lockin-menubar")
+    if menubar_bin is None:
+        menubar_bin = "lockin-menubar"
+    return f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{_LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{menubar_bin}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+"""
+
+
+def _install_menubar_launch_agent() -> bool:
+    """Install the Launch Agent plist for menu bar auto-start."""
+    try:
+        _LAUNCH_AGENT_DIR.mkdir(parents=True, exist_ok=True)
+        _LAUNCH_AGENT_PLIST.write_text(_menubar_plist_content())
+        subprocess.run(
+            ["launchctl", "load", str(_LAUNCH_AGENT_PLIST)],
+            check=True,
+            capture_output=True,
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def _uninstall_menubar_launch_agent() -> bool:
+    """Uninstall the Launch Agent plist for menu bar auto-start."""
+    try:
+        if _LAUNCH_AGENT_PLIST.exists():
+            subprocess.run(
+                ["launchctl", "unload", str(_LAUNCH_AGENT_PLIST)],
+                check=True,
+                capture_output=True,
+            )
+            _LAUNCH_AGENT_PLIST.unlink()
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+def _is_menubar_launch_agent_installed() -> bool:
+    """Check whether the menu bar Launch Agent plist exists."""
+    return _LAUNCH_AGENT_PLIST.exists()
 
 
 def _flow_settings() -> None:
@@ -788,6 +865,29 @@ def _flow_settings() -> None:
             show_apps(installed)
         elif choice == "5":
             console.print(f"lockin v{__version__}")
+        elif choice == "6":
+            menubar_bin = shutil.which("lockin-menubar")
+            if menubar_bin is None:
+                print_error("lockin-menubar not found. Reinstall the package to get the entry point.")
+                continue
+            subprocess.Popen([menubar_bin], start_new_session=True)
+            print_success("Menu bar app launched.")
+        elif choice == "7":
+            if _is_menubar_launch_agent_installed():
+                print_info("Menu bar auto-start is already installed.")
+                continue
+            if _install_menubar_launch_agent():
+                print_success("Menu bar auto-start installed. It will launch at login.")
+            else:
+                print_error("Failed to install menu bar auto-start.")
+        elif choice == "8":
+            if not _is_menubar_launch_agent_installed():
+                print_info("Menu bar auto-start is not installed.")
+                continue
+            if _uninstall_menubar_launch_agent():
+                print_success("Menu bar auto-start removed.")
+            else:
+                print_error("Failed to remove menu bar auto-start.")
 
 
 # ---------------------------------------------------------------------------
