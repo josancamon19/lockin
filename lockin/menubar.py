@@ -16,7 +16,7 @@ class LockinMenuBar(rumps.App):
     """Menu bar app that displays the current focus session status."""
 
     def __init__(self):
-        super().__init__("🔓", quit_button=None)
+        super().__init__("Lockin", title="LI", quit_button=None)
         self.menu = [
             rumps.MenuItem("No active session", callback=None),
             None,  # separator
@@ -30,7 +30,7 @@ class LockinMenuBar(rumps.App):
         session = get_active_session()
 
         if session is None:
-            self.title = "🔓"
+            self.title = "LI"
             self.menu.clear()
             self.menu = [
                 rumps.MenuItem("No active session", callback=None),
@@ -48,7 +48,7 @@ class LockinMenuBar(rumps.App):
         domains_count = len(session.blocked_domains)
         apps_count = len(session.blocked_apps)
 
-        self.title = f"🔒 {format_duration(remaining)}"
+        self.title = f"LI {format_duration(remaining)}"
         self.menu.clear()
         self.menu = [
             rumps.MenuItem(f"Profile: {session.profile_name}", callback=None),
