@@ -259,6 +259,18 @@ def _walk_ax_tree(element: object, max_depth: int, depth: int = 0) -> str | None
     return None
 
 
+def check_accessibility_permission() -> bool:
+    """Check if Accessibility permission is granted (no prompt)."""
+    _ensure_imports()
+    if _AX is None or _HIServices is None:
+        return False
+    try:
+        options = {_HIServices.kAXTrustedCheckOptionPrompt: False}
+        return _AX.AXIsProcessTrustedWithOptions(options)
+    except Exception:
+        return False
+
+
 def request_accessibility_permission() -> bool:
     """Prompt the user for Accessibility permission. Returns current trust status."""
     _ensure_imports()

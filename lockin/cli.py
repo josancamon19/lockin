@@ -826,18 +826,21 @@ def _flow_activity_recap() -> None:
 # Flow: Settings & Info
 # ---------------------------------------------------------------------------
 
-SETTINGS_MENU = [
-    ("1", "Check daemon status"),
-    ("2", "Install daemon"),
-    ("3", "Uninstall daemon"),
-    ("4", "List installed apps"),
-    ("5", "Show version"),
-    ("6", "Launch menu bar app"),
-    ("7", "Install menu bar auto-start"),
-    ("8", "Uninstall menu bar auto-start"),
-    ("9", "Grant Accessibility permission  \u2014  needed for activity tracking"),
-    ("0", "Back"),
-]
+def _build_settings_menu() -> list[tuple[str, str]]:
+    granted = _check_accessibility()
+    status = "[green]ON[/green]" if granted else "[red]OFF[/red]"
+    return [
+        ("1", "Check daemon status"),
+        ("2", "Install daemon"),
+        ("3", "Uninstall daemon"),
+        ("4", "List installed apps"),
+        ("5", "Show version"),
+        ("6", "Launch menu bar app"),
+        ("7", "Install menu bar auto-start"),
+        ("8", "Uninstall menu bar auto-start"),
+        ("9", f"Accessibility permission [{status}]  \u2014  needed for URL tracking"),
+        ("0", "Back"),
+    ]
 
 
 _LAUNCH_AGENT_DIR = Path.home() / "Library" / "LaunchAgents"
@@ -906,8 +909,21 @@ def _is_menubar_launch_agent_installed() -> bool:
     return _LAUNCH_AGENT_PLIST.exists()
 
 
+def _check_accessibility() -> bool:
+    """Check accessibility permission status, returns True if granted."""
+    try:
+        from lockin.tracker import check_accessibility_permission
+        return check_accessibility_permission()
+    except Exception:
+        return False
+
+
 def _flow_grant_accessibility() -> None:
     """Guide the user through granting Accessibility permission."""
+    if _check_accessibility():
+        print_success("Accessibility permission is already granted.")
+        return
+
     # Find the real Python binary that lockin-menubar uses
     python_bin = sys.executable
     try:
@@ -915,7 +931,8 @@ def _flow_grant_accessibility() -> None:
     except OSError:
         real_path = Path(python_bin)
 
-    print_info("Activity tracking needs Accessibility permission to read browser URLs.")
+    print_warning("Accessibility permission is NOT granted.")
+    print_info("Activity tracking needs this permission to read browser URLs.")
     console.print()
     console.print("  [bold]Steps:[/bold]")
     console.print("  1. System Settings will open to Accessibility")
@@ -933,7 +950,7 @@ def _flow_grant_accessibility() -> None:
             input=str(real_path).encode(),
             check=True,
         )
-        print_success(f"Path copied to clipboard.")
+        print_success("Path copied to clipboard.")
     except (OSError, subprocess.CalledProcessError):
         pass
 
@@ -945,7 +962,7 @@ def _flow_grant_accessibility() -> None:
 
 def _flow_settings() -> None:
     while True:
-        choice = show_menu("Settings & Info", SETTINGS_MENU)
+        choice = show_menu("Settings & Info", _build_settings_menu())
         if choice == "0":
             return
         elif choice == "1":
