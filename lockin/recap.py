@@ -105,10 +105,13 @@ def show_daily_recap(target_date: date | None = None) -> None:
 
     # Top apps table
     if top_apps:
+        has_detail = any(row.get("detail") for row in top_apps)
+
         table = Table(title="Top Apps", show_lines=False, pad_edge=False)
         table.add_column("#", style="dim", width=3)
         table.add_column("App", style="bold", min_width=20)
-        table.add_column("Detail", min_width=15)
+        if has_detail:
+            table.add_column("Detail", min_width=15)
         table.add_column("Time", min_width=10)
         table.add_column("Opens", justify="right", min_width=5)
         table.add_column("Category", min_width=12)
@@ -119,14 +122,18 @@ def show_daily_recap(target_date: date | None = None) -> None:
             color = _CATEGORY_COLORS.get(cat, "white")
             detail = row.get("detail") or ""
             opens = row.get("focus_count", 0)
-            table.add_row(
+            cols = [
                 str(i),
                 row.get("app_name", "?"),
-                f"[dim]{detail}[/dim]" if detail else "",
+            ]
+            if has_detail:
+                cols.append(f"[dim]{detail}[/dim]" if detail else "")
+            cols += [
                 format_duration(secs),
                 str(opens),
                 f"[{color}]{cat}[/{color}]",
-            )
+            ]
+            table.add_row(*cols)
         console.print(table)
 
     # Top domains table
@@ -267,6 +274,12 @@ def show_weekly_timeline() -> None:
         day = row.get("day", "")
         days.setdefault(day, []).append(row)
 
+    # Check if any row across the whole week has detail or domain info
+    has_context = any(
+        row.get("detail") or row.get("domain")
+        for row in timeline
+    )
+
     # Render a table per day
     for d in range(7):
         day_date = start + timedelta(days=d)
@@ -274,6 +287,12 @@ def show_weekly_timeline() -> None:
         day_label = day_date.strftime("%A, %b %d")
         entries = days.get(day_str, [])
 
+        if not entries:
+            console.print(f"\n[dim]{day_label} — no data[/dim]")
+            continue
+
+        # Filter out entries with negligible time (< 10s)
+        entries = [e for e in entries if (e.get("total_seconds", 0) or 0) >= 10]
         if not entries:
             console.print(f"\n[dim]{day_label} — no data[/dim]")
             continue
@@ -286,26 +305,26 @@ def show_weekly_timeline() -> None:
             pad_edge=False,
         )
         table.add_column("App", style="bold", min_width=18)
-        table.add_column("Detail / Domain", min_width=22)
+        if has_context:
+            table.add_column("Detail / Domain", min_width=20)
         table.add_column("Time", min_width=8, justify="right")
         table.add_column("Opens", justify="right", min_width=5)
         table.add_column("Cat", min_width=6)
-
-        # Filter out entries with negligible time (< 10s)
-        entries = [e for e in entries if (e.get("total_seconds", 0) or 0) >= 10]
 
         for row in entries:
             secs = row.get("total_seconds", 0) or 0
             cat = row.get("category", "neutral")
             color = _CATEGORY_COLORS.get(cat, "white")
-            detail = row.get("detail") or row.get("domain") or ""
+            context = row.get("detail") or row.get("domain") or ""
             opens = row.get("focus_count", 0)
-            table.add_row(
-                row.get("app_name", "?"),
-                f"[dim]{detail}[/dim]" if detail else "",
+            cols = [row.get("app_name", "?")]
+            if has_context:
+                cols.append(f"[dim]{context}[/dim]" if context else "")
+            cols += [
                 format_duration(secs),
                 str(opens),
                 f"[{color}]{cat[:4]}[/{color}]",
-            )
+            ]
+            table.add_row(*cols)
 
         console.print(table)
