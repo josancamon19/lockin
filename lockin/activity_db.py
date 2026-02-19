@@ -219,6 +219,38 @@ def query_weekly_summary(start: date, end: date) -> list[dict]:
         conn.close()
 
 
+def query_weekly_timeline(start: date, end: date) -> list[dict]:
+    """Detailed per-day breakdown of every app+detail+domain combination.
+
+    Returns rows with: day, app_name, detail, domain, category, focus_count, total_seconds.
+    Ordered by day then total_seconds descending.
+    """
+    range_start = datetime(start.year, start.month, start.day).isoformat()
+    range_end = (datetime(end.year, end.month, end.day) + timedelta(days=1)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT date(started_at) as day,
+                      app_name, detail, domain, category,
+                      COUNT(*) as focus_count,
+                      SUM(
+                          CASE WHEN ended_at IS NOT NULL
+                               THEN MAX(0, julianday(MIN(ended_at, ?)) - julianday(MAX(started_at, ?))) * 86400
+                               ELSE MAX(0, julianday(?) - julianday(MAX(started_at, ?))) * 86400
+                          END
+                      ) as total_seconds
+               FROM activity_log
+               WHERE started_at < ? AND (ended_at > ? OR ended_at IS NULL)
+               GROUP BY day, app_name, detail, domain
+               ORDER BY day, total_seconds DESC""",
+            (range_end, range_start, datetime.now().isoformat(), range_start, range_end, range_start),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 # -- Screenshot functions --
 
 

@@ -14,6 +14,7 @@ from lockin.activity_db import (
     query_top_apps,
     query_top_domains,
     query_weekly_summary,
+    query_weekly_timeline,
 )
 from lockin.ui import format_duration
 
@@ -247,3 +248,64 @@ def get_quick_summary(target_date: date | None = None) -> str:
         f"N: {format_duration(cat_totals['neutral'])} "
         f"D: {format_duration(cat_totals['distracting'])}"
     )
+
+
+def show_weekly_timeline() -> None:
+    """Show a detailed day-by-day timeline of every app, domain, and project."""
+    today = date.today()
+    start = today - timedelta(days=6)
+
+    timeline = query_weekly_timeline(start, today)
+
+    if not timeline:
+        console.print("[dim]No activity data for the past week.[/dim]")
+        return
+
+    # Group rows by day
+    days: dict[str, list[dict]] = {}
+    for row in timeline:
+        day = row.get("day", "")
+        days.setdefault(day, []).append(row)
+
+    # Render a table per day
+    for d in range(7):
+        day_date = start + timedelta(days=d)
+        day_str = day_date.isoformat()
+        day_label = day_date.strftime("%A, %b %d")
+        entries = days.get(day_str, [])
+
+        if not entries:
+            console.print(f"\n[dim]{day_label} — no data[/dim]")
+            continue
+
+        day_total = sum(e.get("total_seconds", 0) or 0 for e in entries)
+
+        table = Table(
+            title=f"{day_label}  ({format_duration(day_total)} total)",
+            show_lines=False,
+            pad_edge=False,
+        )
+        table.add_column("App", style="bold", min_width=18)
+        table.add_column("Detail / Domain", min_width=22)
+        table.add_column("Time", min_width=8, justify="right")
+        table.add_column("Opens", justify="right", min_width=5)
+        table.add_column("Cat", min_width=6)
+
+        # Filter out entries with negligible time (< 10s)
+        entries = [e for e in entries if (e.get("total_seconds", 0) or 0) >= 10]
+
+        for row in entries:
+            secs = row.get("total_seconds", 0) or 0
+            cat = row.get("category", "neutral")
+            color = _CATEGORY_COLORS.get(cat, "white")
+            detail = row.get("detail") or row.get("domain") or ""
+            opens = row.get("focus_count", 0)
+            table.add_row(
+                row.get("app_name", "?"),
+                f"[dim]{detail}[/dim]" if detail else "",
+                format_duration(secs),
+                str(opens),
+                f"[{color}]{cat[:4]}[/{color}]",
+            )
+
+        console.print(table)

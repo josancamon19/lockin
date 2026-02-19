@@ -116,17 +116,17 @@ def _handle_argv() -> bool:
 
 
 def _handle_recap_shortcut(args: list[str]) -> None:
-    """Process ``--recap [daily|weekly] [--date YYYY-MM-DD]``."""
+    """Process ``--recap [daily|weekly|timeline] [--date YYYY-MM-DD]``."""
     from datetime import date, timedelta
 
-    from lockin.recap import show_daily_recap, show_weekly_recap
+    from lockin.recap import show_daily_recap, show_weekly_recap, show_weekly_timeline
 
     mode = "daily"
     target_date = date.today()
 
     i = 0
     while i < len(args):
-        if args[i] in ("daily", "weekly"):
+        if args[i] in ("daily", "weekly", "timeline"):
             mode = args[i]
             i += 1
         elif args[i] == "--date" and i + 1 < len(args):
@@ -142,6 +142,8 @@ def _handle_recap_shortcut(args: list[str]) -> None:
 
     if mode == "weekly":
         show_weekly_recap()
+    elif mode == "timeline":
+        show_weekly_timeline()
     else:
         show_daily_recap(target_date)
 
@@ -835,6 +837,7 @@ RECAP_MENU = [
     ("2", "Yesterday's recap"),
     ("3", "Pick a date"),
     ("4", "Weekly summary"),
+    ("5", "Weekly timeline  —  detailed day-by-day breakdown"),
     ("0", "Back"),
 ]
 
@@ -842,7 +845,7 @@ RECAP_MENU = [
 def _flow_activity_recap() -> None:
     from datetime import date, timedelta
 
-    from lockin.recap import show_daily_recap, show_weekly_recap
+    from lockin.recap import show_daily_recap, show_weekly_recap, show_weekly_timeline
 
     while True:
         choice = show_menu("Activity Recap", RECAP_MENU)
@@ -861,6 +864,8 @@ def _flow_activity_recap() -> None:
                 print_error(f"Invalid date '{raw}'. Use YYYY-MM-DD format.")
         elif choice == "4":
             show_weekly_recap()
+        elif choice == "5":
+            show_weekly_timeline()
 
 
 # ---------------------------------------------------------------------------
