@@ -1192,6 +1192,10 @@ def _flow_settings() -> None:
 
 def main() -> None:
     """Entry point for the ``lockin`` command."""
+    # Ensure DB schema is up to date (runs migrations like adding `detail` column)
+    from lockin.activity_db import init_db
+    init_db()
+
     # Handle CLI shortcuts first
     if _handle_argv():
         return
