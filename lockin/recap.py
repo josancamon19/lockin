@@ -109,6 +109,7 @@ def show_daily_recap(target_date: date | None = None) -> None:
         table.add_column("App", style="bold", min_width=20)
         table.add_column("Detail", min_width=15)
         table.add_column("Time", min_width=10)
+        table.add_column("Opens", justify="right", min_width=5)
         table.add_column("Category", min_width=12)
 
         for i, row in enumerate(top_apps, 1):
@@ -116,11 +117,13 @@ def show_daily_recap(target_date: date | None = None) -> None:
             cat = row.get("category", "neutral")
             color = _CATEGORY_COLORS.get(cat, "white")
             detail = row.get("detail") or ""
+            opens = row.get("focus_count", 0)
             table.add_row(
                 str(i),
                 row.get("app_name", "?"),
                 f"[dim]{detail}[/dim]" if detail else "",
                 format_duration(secs),
+                str(opens),
                 f"[{color}]{cat}[/{color}]",
             )
         console.print(table)

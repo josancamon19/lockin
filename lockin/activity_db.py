@@ -143,6 +143,7 @@ def query_top_apps(target_date: date, limit: int = 10) -> list[dict]:
     try:
         rows = conn.execute(
             """SELECT app_name, detail, category,
+                      COUNT(*) as focus_count,
                       SUM(
                           CASE WHEN ended_at IS NOT NULL
                                THEN MAX(0, julianday(MIN(ended_at, ?)) - julianday(MAX(started_at, ?))) * 86400
