@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -135,22 +136,22 @@ def get_frontmost_app() -> tuple[str | None, str | None, int | None]:
 
 
 def get_window_title(pid: int) -> str | None:
-    """Get the window title for a given PID using CGWindowListCopyWindowInfo."""
+    """Get the window title for a given PID using the Accessibility API.
+
+    Uses AXFocusedWindow -> AXTitle which only requires Accessibility permission
+    (not Screen Recording like CGWindowListCopyWindowInfo).
+    """
     _ensure_imports()
-    if _CG is None:
+    if _AX is None:
         return None
     try:
-        window_list = _CG.CGWindowListCopyWindowInfo(
-            _CG.kCGWindowListOptionOnScreenOnly | _CG.kCGWindowListExcludeDesktopElements,
-            _CG.kCGNullWindowID,
-        )
-        if window_list is None:
+        app_element = _AX.AXUIElementCreateApplication(pid)
+        window = _ax_get_attr(app_element, "AXFocusedWindow")
+        if window is None:
             return None
-        for window in window_list:
-            if window.get("kCGWindowOwnerPID") == pid:
-                title = window.get("kCGWindowName")
-                if title:
-                    return str(title)
+        title = _ax_get_attr(window, "AXTitle")
+        if title:
+            return str(title)
         return None
     except Exception:
         return None
@@ -199,36 +200,74 @@ def _extract_domain(url: str) -> str | None:
     return None
 
 
-# Cache for URL extraction to avoid re-traversal
+# AppleScript templates for URL extraction, keyed by lowercase bundle ID.
+# Chrome-based browsers all support the same `URL of active tab of front window`.
+_APPLESCRIPT_URL: dict[str, str] = {
+    "com.google.chrome": 'tell application "Google Chrome" to get URL of active tab of front window',
+    "company.thebrowser.browser": 'tell application "Arc" to get URL of active tab of front window',
+    "com.brave.browser": 'tell application "Brave Browser" to get URL of active tab of front window',
+    "com.microsoft.edgemac": 'tell application "Microsoft Edge" to get URL of active tab of front window',
+    "com.vivaldi.vivaldi": 'tell application "Vivaldi" to get URL of active tab of front window',
+    "com.operasoftware.opera": 'tell application "Opera" to get URL of active tab of front window',
+    "org.chromium.chromium": 'tell application "Chromium" to get URL of active tab of front window',
+    "com.apple.safari": 'tell application "Safari" to get URL of front document',
+}
+
+
+def _run_applescript(script: str, timeout: float = 1.0) -> str | None:
+    """Run an AppleScript snippet and return the stdout, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+# Cache for URL extraction to avoid repeated AppleScript calls
 _url_cache: dict[tuple[int, str | None], str | None] = {}
 _url_cache_max = 50
 
 
-def extract_browser_url(pid: int, window_title: str | None = None) -> str | None:
-    """Extract the URL from a browser's address bar via the Accessibility API.
+def extract_browser_url(pid: int, bundle_id: str | None = None, window_title: str | None = None) -> str | None:
+    """Extract the URL from a browser using AppleScript (preferred) or AX fallback.
 
-    Uses AXUIElement traversal to find text fields that contain URL-like values.
-    Results are cached by (pid, window_title) to avoid repeated traversal.
+    AppleScript is used for Chrome-based browsers and Safari.
+    AX tree walking is used as a fallback (e.g. Firefox).
     """
-    _ensure_imports()
-    if _AX is None:
-        return None
-
     cache_key = (pid, window_title)
     if cache_key in _url_cache:
         return _url_cache[cache_key]
 
-    try:
-        app_element = _AX.AXUIElementCreateApplication(pid)
-        url = _walk_ax_tree(app_element, max_depth=10)
+    url: str | None = None
 
-        # Manage cache size
-        if len(_url_cache) >= _url_cache_max:
-            _url_cache.clear()
-        _url_cache[cache_key] = url
-        return url
-    except Exception:
-        return None
+    # Try AppleScript first if we know the bundle ID
+    if bundle_id:
+        script = _APPLESCRIPT_URL.get(bundle_id.lower())
+        if script:
+            url = _run_applescript(script)
+
+    # Fallback to AX tree walking (e.g. Firefox or unknown browsers)
+    if url is None:
+        _ensure_imports()
+        if _AX is not None:
+            try:
+                app_element = _AX.AXUIElementCreateApplication(pid)
+                url = _walk_ax_tree(app_element, max_depth=10)
+            except Exception:
+                pass
+
+    # Manage cache size
+    if len(_url_cache) >= _url_cache_max:
+        _url_cache.clear()
+    _url_cache[cache_key] = url
+    return url
 
 
 def _ax_get_attr(element: object, attr: str) -> object | None:
@@ -272,6 +311,88 @@ def _walk_ax_tree(element: object, max_depth: int, depth: int = 0) -> str | None
                     return result
         except Exception:
             pass
+
+    return None
+
+
+# -- Editor / terminal bundle IDs for detail extraction --
+
+_EDITOR_BUNDLE_IDS: set[str] = {
+    "com.todesktop.230313mzl4w4u92",  # Cursor
+    "com.microsoft.VSCode",
+    "com.vscodium.VSCodium",
+    "dev.zed.Zed",
+    "com.jetbrains.intellij",
+    "com.jetbrains.pycharm",
+    "com.jetbrains.webstorm",
+    "com.jetbrains.goland",
+    "com.jetbrains.CLion",
+    "com.sublimetext.4",
+    "com.sublimetext.3",
+}
+
+_TERMINAL_BUNDLE_IDS: set[str] = {
+    "com.googlecode.iterm2",
+    "com.apple.Terminal",
+    "dev.warp.Warp-Stable",
+    "io.alacritty",
+    "com.github.wez.wezterm",
+    "net.kovidgoyal.kitty",
+}
+
+
+def extract_detail(bundle_id: str | None, window_title: str | None) -> str | None:
+    """Extract a project/directory context from an editor or terminal window title.
+
+    Editors (Cursor, VS Code): title format is typically "file - project - AppName"
+        -> returns the project name.
+    Terminals (iTerm2): use AppleScript to get session working directory.
+    Other terminals: parse the window title (often contains CWD).
+    """
+    if not bundle_id:
+        return None
+
+    bid = bundle_id.lower()
+
+    # -- Editors: parse "file - project - AppName" pattern --
+    if bundle_id in _EDITOR_BUNDLE_IDS and window_title:
+        parts = window_title.split(" \u2014 ")
+        if len(parts) < 2:
+            parts = window_title.split(" - ")
+        if len(parts) >= 2:
+            # Project name is typically the second-to-last segment
+            project = parts[-2].strip() if len(parts) >= 3 else parts[0].strip()
+            # Skip generic names
+            if project and project.lower() not in ("welcome", "get started", "untitled"):
+                return project
+        return None
+
+    # -- Terminals --
+    if bundle_id in _TERMINAL_BUNDLE_IDS:
+        # iTerm2: get CWD via AppleScript
+        if bid == "com.googlecode.iterm2":
+            script = (
+                'tell application "iTerm2" to tell current session of current window '
+                "to get variable named \"session.path\""
+            )
+            path = _run_applescript(script)
+            if path:
+                # Return just the last component (project dir name)
+                return Path(path).name or None
+
+        # Other terminals: parse window title which often contains CWD
+        if window_title:
+            # Common patterns: "user@host:~/projects/foo", "~/projects/foo", "/Users/.../foo"
+            title = window_title.strip()
+            # Strip "user@host:" prefix
+            if ":" in title:
+                title = title.split(":", 1)[1].strip()
+            if title.startswith("~") or title.startswith("/"):
+                return Path(title).name or None
+            # If the title looks like a plain directory name, use it
+            if "/" not in title and " " not in title and len(title) < 60:
+                return title
+        return None
 
     return None
 
@@ -336,12 +457,19 @@ def capture_screenshot(directory: Path) -> Path | None:
 class ActivityTracker:
     """Tracks frontmost app activity, writing to SQLite on state changes."""
 
+    # If the gap between two consecutive polls exceeds this, we assume the
+    # system was asleep and close the previous activity at the old timestamp
+    # rather than at "now".
+    SLEEP_GAP_THRESHOLD = 120  # seconds
+
     def __init__(self) -> None:
         init_db()
         self._current_row_id: int | None = None
         self._current_app: str | None = None
         self._current_domain: str | None = None
         self._current_bundle: str | None = None
+        self._current_detail: str | None = None
+        self._last_poll_time: datetime | None = None
 
         # Screenshot state
         cfg = load_config()
@@ -356,6 +484,17 @@ class ActivityTracker:
 
     def poll(self) -> None:
         """Called every tick. Detects state changes and writes to DB."""
+        now = datetime.now()
+
+        # Idle/sleep detection: if we haven't polled in a long time the
+        # system was likely asleep.  Close the previous activity at the
+        # old timestamp (+ 5 s buffer) so we don't attribute sleep hours.
+        if self._last_poll_time is not None:
+            gap = (now - self._last_poll_time).total_seconds()
+            if gap > self.SLEEP_GAP_THRESHOLD and self._current_row_id is not None:
+                self._close_current_at(self._last_poll_time + timedelta(seconds=5))
+        self._last_poll_time = now
+
         # Screenshot capture
         if self._screenshot_settings.enabled:
             self._screenshot_tick += 1
@@ -383,17 +522,24 @@ class ActivityTracker:
         domain: str | None = None
         url: str | None = None
         window_title: str | None = None
+        detail: str | None = None
 
         if pid is not None:
             window_title = get_window_title(pid)
 
             if is_browser(bundle_id, app_name):
-                url = extract_browser_url(pid, window_title)
+                url = extract_browser_url(pid, bundle_id, window_title)
                 if url:
                     domain = _extract_domain(url)
+            else:
+                detail = extract_detail(bundle_id, window_title)
 
-        # Detect state change: different app OR different domain
-        if app_name == self._current_app and domain == self._current_domain:
+        # Detect state change: different app, domain, OR detail (project)
+        if (
+            app_name == self._current_app
+            and domain == self._current_domain
+            and detail == self._current_detail
+        ):
             return  # No change
 
         # Close previous activity
@@ -413,20 +559,26 @@ class ActivityTracker:
             domain=domain,
             category=category,
             preset_match=preset_match,
+            detail=detail,
         )
         self._current_app = app_name
         self._current_domain = domain
         self._current_bundle = bundle_id
+        self._current_detail = detail
 
-    def _close_current(self) -> None:
-        """Close the current activity row with an ended_at timestamp."""
+    def _close_current_at(self, ended_at: datetime) -> None:
+        """Close the current activity row with a specific ended_at timestamp."""
         if self._current_row_id is not None:
-            now = datetime.now().isoformat()
-            close_activity(self._current_row_id, now)
+            close_activity(self._current_row_id, ended_at.isoformat())
             self._current_row_id = None
             self._current_app = None
             self._current_domain = None
             self._current_bundle = None
+            self._current_detail = None
+
+    def _close_current(self) -> None:
+        """Close the current activity row with an ended_at of now."""
+        self._close_current_at(datetime.now())
 
     def reload_screenshot_settings(self) -> None:
         """Reload screenshot settings from config (e.g. after user changes them)."""

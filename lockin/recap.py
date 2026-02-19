@@ -107,6 +107,7 @@ def show_daily_recap(target_date: date | None = None) -> None:
         table = Table(title="Top Apps", show_lines=False, pad_edge=False)
         table.add_column("#", style="dim", width=3)
         table.add_column("App", style="bold", min_width=20)
+        table.add_column("Detail", min_width=15)
         table.add_column("Time", min_width=10)
         table.add_column("Category", min_width=12)
 
@@ -114,9 +115,11 @@ def show_daily_recap(target_date: date | None = None) -> None:
             secs = row.get("total_seconds", 0) or 0
             cat = row.get("category", "neutral")
             color = _CATEGORY_COLORS.get(cat, "white")
+            detail = row.get("detail") or ""
             table.add_row(
                 str(i),
                 row.get("app_name", "?"),
+                f"[dim]{detail}[/dim]" if detail else "",
                 format_duration(secs),
                 f"[{color}]{cat}[/{color}]",
             )

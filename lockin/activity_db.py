@@ -57,6 +57,11 @@ def init_db() -> None:
         conn.execute(_CREATE_SCREENSHOTS_TABLE)
         conn.execute(_CREATE_INDEX)
         conn.execute(_CREATE_SCREENSHOTS_INDEX)
+        # Migration: add detail column if missing (safe for existing DBs)
+        try:
+            conn.execute("ALTER TABLE activity_log ADD COLUMN detail TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         conn.commit()
     finally:
         conn.close()
@@ -71,14 +76,15 @@ def insert_activity(
     domain: str | None,
     category: str,
     preset_match: str | None,
+    detail: str | None = None,
 ) -> int:
     conn = _connect()
     try:
         cur = conn.execute(
             """INSERT INTO activity_log
-               (started_at, app_name, bundle_id, window_title, url, domain, category, preset_match)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (started_at, app_name, bundle_id, window_title, url, domain, category, preset_match),
+               (started_at, app_name, bundle_id, window_title, url, domain, category, preset_match, detail)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (started_at, app_name, bundle_id, window_title, url, domain, category, preset_match, detail),
         )
         conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
@@ -129,14 +135,14 @@ def query_daily_summary(target_date: date) -> list[dict]:
 
 
 def query_top_apps(target_date: date, limit: int = 10) -> list[dict]:
-    """Top apps by total time for a given date."""
+    """Top apps by total time for a given date, split by detail (project/dir)."""
     day_start = datetime(target_date.year, target_date.month, target_date.day).isoformat()
     day_end = (datetime(target_date.year, target_date.month, target_date.day) + timedelta(days=1)).isoformat()
 
     conn = _connect()
     try:
         rows = conn.execute(
-            """SELECT app_name, category,
+            """SELECT app_name, detail, category,
                       SUM(
                           CASE WHEN ended_at IS NOT NULL
                                THEN MAX(0, julianday(MIN(ended_at, ?)) - julianday(MAX(started_at, ?))) * 86400
@@ -145,7 +151,7 @@ def query_top_apps(target_date: date, limit: int = 10) -> list[dict]:
                       ) as total_seconds
                FROM activity_log
                WHERE started_at < ? AND (ended_at > ? OR ended_at IS NULL)
-               GROUP BY app_name
+               GROUP BY app_name, detail
                ORDER BY total_seconds DESC
                LIMIT ?""",
             (day_end, day_start, datetime.now().isoformat(), day_start, day_end, day_start, limit),
@@ -256,5 +262,49 @@ def query_screenshots_for_date(target_date: date) -> list[dict]:
             (day_start, day_end),
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def fix_overnight_entries(dry_run: bool = True) -> list[dict]:
+    """Find entries that cross midnight with duration > 1 hour and cap them.
+
+    These are phantom entries caused by the system sleeping while an activity
+    was open.  Each such entry gets its ended_at capped to started_at + 1 hour.
+
+    Returns a list of dicts describing the affected rows.
+    """
+    conn = _connect()
+    try:
+        # Find entries where started_at and ended_at are on different dates
+        # and the total duration exceeds 1 hour (3600 seconds).
+        rows = conn.execute(
+            """SELECT id, started_at, ended_at, app_name, domain, detail,
+                      (julianday(ended_at) - julianday(started_at)) * 86400 as duration_seconds
+               FROM activity_log
+               WHERE ended_at IS NOT NULL
+                     AND date(started_at) != date(ended_at)
+                     AND (julianday(ended_at) - julianday(started_at)) * 86400 > 3600
+               ORDER BY started_at"""
+        ).fetchall()
+
+        affected = []
+        for row in rows:
+            info = dict(row)
+            started = datetime.fromisoformat(info["started_at"])
+            capped_end = started + timedelta(hours=1)
+            info["new_ended_at"] = capped_end.isoformat()
+            info["old_ended_at"] = info["ended_at"]
+            affected.append(info)
+
+        if not dry_run and affected:
+            for entry in affected:
+                conn.execute(
+                    "UPDATE activity_log SET ended_at = ? WHERE id = ?",
+                    (entry["new_ended_at"], entry["id"]),
+                )
+            conn.commit()
+
+        return affected
     finally:
         conn.close()

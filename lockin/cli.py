@@ -100,12 +100,18 @@ def _handle_argv() -> bool:
         _handle_recap_shortcut(args[1:])
         return True
 
+    # --fix-overnight [--dry-run]
+    if args[0] == "--fix-overnight":
+        _handle_fix_overnight(args[1:])
+        return True
+
     # Unknown flag — print help hint
     print_error(f"Unknown option: {args[0]}")
     console.print("[dim]Usage: lockin              (interactive menu)[/dim]")
     console.print("[dim]       lockin --version    (show version)[/dim]")
     console.print("[dim]       lockin --status     (show session status)[/dim]")
     console.print("[dim]       lockin --recap      (show activity recap)[/dim]")
+    console.print("[dim]       lockin --fix-overnight [--dry-run]  (fix phantom overnight entries)[/dim]")
     return True
 
 
@@ -138,6 +144,41 @@ def _handle_recap_shortcut(args: list[str]) -> None:
         show_weekly_recap()
     else:
         show_daily_recap(target_date)
+
+
+def _handle_fix_overnight(args: list[str]) -> None:
+    """Process ``--fix-overnight [--dry-run]``."""
+    from lockin.activity_db import fix_overnight_entries
+
+    dry_run = "--dry-run" in args
+
+    if dry_run:
+        print_info("Dry run — no changes will be made.")
+
+    affected = fix_overnight_entries(dry_run=dry_run)
+
+    if not affected:
+        print_success("No phantom overnight entries found.")
+        return
+
+    console.print(f"\n[bold]{'Found' if dry_run else 'Fixed'} {len(affected)} overnight entries:[/bold]\n")
+    for entry in affected:
+        app = entry.get("app_name", "?")
+        detail = entry.get("detail") or ""
+        domain = entry.get("domain") or ""
+        label = domain or detail or app
+        old_dur = entry.get("duration_seconds", 0)
+        hours = old_dur / 3600
+        console.print(
+            f"  [dim]id={entry['id']}[/dim]  {label}  "
+            f"[red]{hours:.1f}h[/red] -> [green]1.0h[/green]  "
+            f"({entry['started_at'][:16]})"
+        )
+
+    if dry_run:
+        console.print(f"\n[dim]Run without --dry-run to apply fixes.[/dim]")
+    else:
+        print_success(f"Capped {len(affected)} entries to 1 hour each.")
 
 
 def _handle_start_session_shortcut(args: list[str]) -> None:
