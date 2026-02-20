@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import os
 import sys
-from pathlib import Path
 
 import psutil
 import rumps
@@ -15,9 +14,21 @@ from lockin.ui import format_duration
 
 POLL_INTERVAL = 1  # seconds
 
-# Resolve icon path relative to this file
-_ASSETS_DIR = Path(__file__).parent / "assets"
-_ICON_PATH = _ASSETS_DIR / "menubar_iconTemplate.png"
+
+def _create_lock_icon():
+    """Create a lock template icon for the menu bar using SF Symbols."""
+    try:
+        from AppKit import NSImage
+
+        icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "lock.fill", "Lockin"
+        )
+        if icon:
+            icon.setTemplate_(True)
+            return icon
+    except Exception:
+        pass
+    return None
 
 
 def _is_already_running() -> bool:
@@ -42,8 +53,11 @@ class LockinMenuBar(rumps.App):
     """Menu bar app that displays the current focus session status."""
 
     def __init__(self):
-        icon = str(_ICON_PATH) if _ICON_PATH.exists() else None
-        super().__init__("Lockin", icon=icon, title=None, quit_button=None, template=True)
+        super().__init__("Lockin", title=None, quit_button=None)
+        # Set SF Symbol lock icon directly (bypasses file-based icon loading)
+        icon = _create_lock_icon()
+        if icon:
+            self._icon = icon
 
         # Initialize activity tracker
         self._tracker = None
