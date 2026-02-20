@@ -1,6 +1,6 @@
 [project]
 name = "lockin"
-version = "0.4.0"
+version = "0.5.0"
 description = "CLI focus blocker for macOS — block distracting websites and apps"
 readme = "README.md"
 requires-python = ">=3.11"
