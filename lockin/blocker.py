@@ -1,13 +1,20 @@
-"""/etc/hosts manipulation, DNS cache flushing, and chflags protection."""
+"""/etc/hosts manipulation, DNS cache flushing, chflags protection, and pfctl firewall rules."""
 
 from __future__ import annotations
 
+import socket
 import subprocess
 from pathlib import Path
 
 HOSTS_FILE = Path("/etc/hosts")
 BLOCK_START = "# >>> LOCKIN BLOCK START >>>"
 BLOCK_END = "# <<< LOCKIN BLOCK END <<<"
+
+# pfctl (packet filter) paths
+PFCTL_DIR = Path("/var/lockin")
+PFCTL_RULES_FILE = PFCTL_DIR / "pf_rules.conf"
+PFCTL_TOKEN_FILE = PFCTL_DIR / "pfctl_token"
+PFCTL_ANCHOR = "com.lockin"
 
 
 def _run(cmd: list[str], check: bool = False) -> subprocess.CompletedProcess:
@@ -66,6 +73,91 @@ def flush_dns_cache() -> None:
     _run(["killall", "-HUP", "mDNSResponder"])
 
 
+def resolve_domain_ips(domains: list[str]) -> set[str]:
+    """Resolve a list of domains to their IP addresses using socket.getaddrinfo()."""
+    ips: set[str] = set()
+    for domain in domains:
+        if not domain:
+            continue
+        try:
+            results = socket.getaddrinfo(domain, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for family, _type, _proto, _canon, sockaddr in results:
+                ips.add(sockaddr[0])
+        except (socket.gaierror, OSError):
+            continue
+    # Remove loopback/localhost IPs to avoid blocking ourselves
+    ips.discard("0.0.0.0")
+    ips.discard("127.0.0.1")
+    ips.discard("::1")
+    return ips
+
+
+def apply_pfctl_rules(domains: list[str]) -> bool:
+    """Write pfctl rules to block IPs of given domains at the kernel packet-filter level.
+
+    Uses a named anchor so rules can be flushed independently.
+    Returns True if rules were applied successfully.
+    """
+    ips = resolve_domain_ips(domains)
+    if not ips:
+        return True  # nothing to block at IP level
+
+    PFCTL_DIR.mkdir(parents=True, exist_ok=True)
+
+    ip_list = " ".join(sorted(ips))
+    rules = (
+        f"table <lockin_blocked> persist {{ {ip_list} }}\n"
+        f"block drop out quick proto {{ tcp, udp }} to <lockin_blocked>\n"
+    )
+    PFCTL_RULES_FILE.write_text(rules)
+
+    # Load rules into the anchor
+    result = _run(["pfctl", "-a", PFCTL_ANCHOR, "-f", str(PFCTL_RULES_FILE)])
+    if result.returncode != 0:
+        return False
+
+    # Enable pfctl if not already enabled (save the token for clean disable)
+    result = _run(["pfctl", "-E"])
+    # pfctl -E prints "Token : <N>" on stderr
+    for line in result.stderr.splitlines():
+        if "Token" in line:
+            token = line.split(":")[-1].strip()
+            PFCTL_TOKEN_FILE.write_text(token)
+            break
+
+    return True
+
+
+def remove_pfctl_rules() -> bool:
+    """Flush the lockin pfctl anchor and release the enable token."""
+    # Flush the anchor rules
+    _run(["pfctl", "-a", PFCTL_ANCHOR, "-F", "all"])
+
+    # Release the enable token
+    if PFCTL_TOKEN_FILE.exists():
+        try:
+            token = PFCTL_TOKEN_FILE.read_text().strip()
+            if token:
+                _run(["pfctl", "-X", token])
+            PFCTL_TOKEN_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Clean up rules file
+    try:
+        PFCTL_RULES_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    return True
+
+
+def are_pfctl_rules_applied() -> bool:
+    """Check if the lockin pfctl anchor has active rules."""
+    result = _run(["pfctl", "-a", PFCTL_ANCHOR, "-sr"])
+    return "lockin_blocked" in result.stdout
+
+
 def apply_blocks(domains: list[str]) -> bool:
     """Write domain blocks to /etc/hosts and protect the file.
 
@@ -87,11 +179,15 @@ def apply_blocks(domains: list[str]) -> bool:
 
     set_immutable_flag()
     flush_dns_cache()
+
+    # Also apply pfctl rules for kernel-level blocking
+    apply_pfctl_rules(domains)
+
     return True
 
 
 def remove_blocks() -> bool:
-    """Remove all lockin blocks from /etc/hosts.
+    """Remove all lockin blocks from /etc/hosts and pfctl rules.
 
     Returns True if blocks were removed successfully.
     """
@@ -108,6 +204,10 @@ def remove_blocks() -> bool:
         return False
 
     flush_dns_cache()
+
+    # Also remove pfctl rules
+    remove_pfctl_rules()
+
     return True
 
 

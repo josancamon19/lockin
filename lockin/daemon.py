@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import signal
 import subprocess
 import sys
 import time
@@ -113,29 +114,130 @@ def is_daemon_installed() -> bool:
     return PLIST_PATH.exists()
 
 
+def _get_package_paths() -> list[Path]:
+    """Derive paths to protect from pipx uninstall during active sessions.
+
+    Protects the venv entry points, the package site-packages dir,
+    and the pipx bin symlinks.
+    """
+    paths: list[Path] = []
+    venv_root = Path(sys.prefix)  # e.g. ~/.local/pipx/venvs/lockin
+
+    # Venv bin dir (contains the lockin entry point script)
+    venv_bin = venv_root / "bin"
+    if venv_bin.exists():
+        paths.append(venv_bin)
+
+    # Site-packages lockin dir
+    vi = sys.version_info
+    site_pkg = venv_root / "lib" / f"python{vi.major}.{vi.minor}" / "site-packages" / "lockin"
+    if site_pkg.exists():
+        paths.append(site_pkg)
+
+    # pipx bin symlinks (e.g. ~/.local/bin/lockin)
+    pipx_bin = Path.home() / ".local" / "bin"
+    if pipx_bin.exists():
+        for name in ("lockin", "lockin-menubar"):
+            p = pipx_bin / name
+            if p.exists():
+                paths.append(p)
+
+    return paths
+
+
+def _protect_package(protect: bool = True) -> None:
+    """Set or remove schg on package paths to prevent pipx uninstall."""
+    flag = "schg" if protect else "noschg"
+    for p in _get_package_paths():
+        subprocess.run(["chflags", flag, str(p)], capture_output=True)
+
+
+def _protect_plist() -> None:
+    """Verify the daemon plist exists, is immutable, and is registered with launchd.
+
+    Re-creates and re-bootstraps if anything is missing.
+    """
+    needs_bootstrap = False
+
+    if not PLIST_PATH.exists():
+        _log("Plist missing, re-creating")
+        plist_data = generate_plist()
+        with open(PLIST_PATH, "wb") as f:
+            plistlib.dump(plist_data, f)
+        os.chmod(PLIST_PATH, 0o644)
+        os.chown(PLIST_PATH, 0, 0)
+        needs_bootstrap = True
+
+    # Ensure immutable flag
+    result = subprocess.run(
+        ["ls", "-lO", str(PLIST_PATH)], capture_output=True, text=True
+    )
+    if "schg" not in result.stdout:
+        subprocess.run(["chflags", "schg", str(PLIST_PATH)], capture_output=True)
+
+    # Check launchd registration
+    result = subprocess.run(
+        ["launchctl", "print", f"system/{PLIST_LABEL}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        needs_bootstrap = True
+
+    if needs_bootstrap:
+        _log("Re-bootstrapping daemon plist")
+        subprocess.run(
+            ["launchctl", "bootstrap", "system", str(PLIST_PATH)],
+            capture_output=True,
+        )
+
+
 def _enforce_blocks(sess: session.Session) -> None:
-    """Re-apply all blocks for the active session."""
-    # Ensure hosts blocks are present
+    """Re-apply all protection layers for the active session."""
+    # 1. Hosts blocks
     if not blocker.are_blocks_applied(sess.blocked_domains):
         _log("Blocks missing from /etc/hosts, re-applying")
         blocker.apply_blocks(sess.blocked_domains)
 
-    # Ensure immutable flag is set
+    # 2. Hosts immutable flag
     if not blocker.is_immutable():
         _log("Immutable flag missing, re-setting")
         blocker.set_immutable_flag()
 
-    # Kill blocked apps
+    # 3. pfctl rules
+    if not blocker.are_pfctl_rules_applied():
+        _log("pfctl rules missing, re-applying")
+        blocker.apply_pfctl_rules(sess.blocked_domains)
+
+    # 4. Session file immutable
+    if not session.is_session_immutable():
+        _log("Session file immutable flag missing, re-setting")
+        session.set_session_immutable()
+
+    # 5. Plist protected
+    _protect_plist()
+
+    # 6. Package protected
+    _protect_package(protect=True)
+
+    # 7. Kill blocked apps
     killed = apps.kill_blocked_apps(sess.blocked_apps)
     if killed:
         _log(f"Killed blocked apps: {', '.join(killed)}")
 
 
 def _cleanup(sess: session.Session) -> None:
-    """Remove all blocks and clean up after a valid expired session."""
-    _log("Session expired, cleaning up blocks")
-    blocker.remove_blocks()
+    """Remove all protections and clean up after a valid expired session."""
+    _log("Session expired, cleaning up")
+
+    # 1. Remove package protection
+    _protect_package(protect=False)
+
+    # 2. Remove session immutability + delete session
     session.delete_session()
+
+    # 3. Remove hosts blocks + pfctl rules
+    blocker.remove_blocks()
+
     _log("Cleanup complete")
 
 
@@ -284,8 +386,27 @@ def _try_trigger_schedule(
     _save_schedule_state(state)
 
 
+def _setup_signal_handlers() -> None:
+    """Ignore SIGTERM/SIGINT during active sessions so launchctl bootout can't stop us.
+
+    SIGKILL can't be caught, but KeepAlive in the plist will restart us immediately.
+    """
+    def _signal_handler(signum: int, frame: object) -> None:
+        sess = session.load_session()
+        if sess and sess.verify() and not sess.is_expired:
+            _log(f"Ignoring signal {signum} — active session in progress")
+            return
+        # No active session — allow termination
+        _log(f"Received signal {signum} — no active session, exiting")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+
 def watchdog_loop() -> None:
     """Main watchdog loop — runs every WATCHDOG_INTERVAL seconds."""
+    _setup_signal_handlers()
     _log("Watchdog daemon started")
 
     while True:

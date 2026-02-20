@@ -129,10 +129,42 @@ def create_session(
     return session
 
 
+def set_session_immutable() -> bool:
+    """Set the system immutable flag on the session file."""
+    if not SESSION_FILE.exists():
+        return False
+    result = subprocess.run(
+        ["chflags", "schg", str(SESSION_FILE)], capture_output=True
+    )
+    return result.returncode == 0
+
+
+def remove_session_immutable() -> bool:
+    """Remove the system immutable flag from the session file."""
+    if not SESSION_FILE.exists():
+        return True
+    result = subprocess.run(
+        ["chflags", "noschg", str(SESSION_FILE)], capture_output=True
+    )
+    return result.returncode == 0
+
+
+def is_session_immutable() -> bool:
+    """Check if the session file has the system immutable flag set."""
+    if not SESSION_FILE.exists():
+        return False
+    result = subprocess.run(
+        ["ls", "-lO", str(SESSION_FILE)], capture_output=True, text=True
+    )
+    return "schg" in result.stdout
+
+
 def save_session(session: Session) -> None:
-    """Write session to disk."""
+    """Write session to disk and protect with immutable flag."""
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    remove_session_immutable()
     SESSION_FILE.write_text(json.dumps(session.to_dict(), indent=2) + "\n")
+    set_session_immutable()
 
 
 def load_session() -> Session | None:
@@ -147,8 +179,9 @@ def load_session() -> Session | None:
 
 
 def delete_session() -> None:
-    """Remove the session file."""
+    """Remove the session file (removing immutable flag first)."""
     try:
+        remove_session_immutable()
         SESSION_FILE.unlink(missing_ok=True)
     except OSError:
         pass
