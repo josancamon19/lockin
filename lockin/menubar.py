@@ -33,11 +33,18 @@ def _create_sf_icon(symbol_name: str):
 
 
 def _hide_dock_icon():
-    """Hide the Python rocketship from the Dock."""
-    try:
-        from AppKit import NSApp, NSApplicationActivationPolicyAccessory
+    """Hide the Python rocketship from the Dock.
 
-        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    Must be called before NSApplication.sharedApplication() / rumps .run().
+    Modifying the bundle's Info.plist is the only way to prevent the Dock icon
+    from flashing before setActivationPolicy_ can take effect.
+    """
+    try:
+        from Foundation import NSBundle
+
+        bundle = NSBundle.mainBundle()
+        info = bundle.infoDictionary()
+        info["LSUIElement"] = "1"
     except Exception:
         pass
 
