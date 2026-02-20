@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
+from pathlib import Path
 
+import psutil
 import rumps
 
 from lockin.session import get_active_session
@@ -11,12 +15,32 @@ from lockin.ui import format_duration
 
 POLL_INTERVAL = 1  # seconds
 
+# Resolve icon path relative to this file
+_ASSETS_DIR = Path(__file__).parent / "assets"
+_ICON_PATH = _ASSETS_DIR / "menubar_iconTemplate.png"
+
+
+def _is_already_running() -> bool:
+    """Check if another lockin-menubar process is already running."""
+    my_pid = os.getpid()
+    count = 0
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = proc.info["cmdline"]
+            if cmdline and any("lockin.menubar" in arg for arg in cmdline):
+                if proc.info["pid"] != my_pid:
+                    count += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return count > 0
+
 
 class LockinMenuBar(rumps.App):
     """Menu bar app that displays the current focus session status."""
 
     def __init__(self):
-        super().__init__("Lockin", title="LI", quit_button=None)
+        icon = str(_ICON_PATH) if _ICON_PATH.exists() else None
+        super().__init__("Lockin", icon=icon, title=None, quit_button=None, template=True)
 
         # Initialize activity tracker
         self._tracker = None
@@ -49,7 +73,7 @@ class LockinMenuBar(rumps.App):
         session = get_active_session()
 
         if session is None:
-            self.title = "LI"
+            self.title = None
             self.menu.clear()
             self.menu = [
                 rumps.MenuItem("No active session", callback=None),
@@ -68,7 +92,7 @@ class LockinMenuBar(rumps.App):
         domains_count = len(session.blocked_domains)
         apps_count = len(session.blocked_apps)
 
-        self.title = f"LI {format_duration(remaining)}"
+        self.title = format_duration(remaining)
         self.menu.clear()
         self.menu = [
             rumps.MenuItem(f"Profile: {session.profile_name}", callback=None),
@@ -109,6 +133,9 @@ class LockinMenuBar(rumps.App):
 
 def main():
     """Entry point for the lockin-menubar command."""
+    if _is_already_running():
+        print("lockin-menubar is already running.")
+        sys.exit(0)
     LockinMenuBar().run()
 
 
