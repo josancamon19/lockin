@@ -23,16 +23,19 @@ _ICON_PATH = _ASSETS_DIR / "menubar_iconTemplate.png"
 def _is_already_running() -> bool:
     """Check if another lockin-menubar process is already running."""
     my_pid = os.getpid()
-    count = 0
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            cmdline = proc.info["cmdline"]
-            if cmdline and any("lockin.menubar" in arg for arg in cmdline):
-                if proc.info["pid"] != my_pid:
-                    count += 1
+            if proc.info["pid"] == my_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            # Match the actual entry point: "-m lockin.menubar" or a binary named lockin-menubar
+            has_module = "-m" in cmdline and "lockin.menubar" in cmdline
+            has_binary = any(arg.endswith("lockin-menubar") for arg in cmdline[:1])
+            if has_module or has_binary:
+                return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return count > 0
+    return False
 
 
 class LockinMenuBar(rumps.App):
