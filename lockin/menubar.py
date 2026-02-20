@@ -5,23 +5,24 @@ from __future__ import annotations
 import math
 import os
 import sys
+from pathlib import Path
 
-import psutil
 import rumps
 
 from lockin.session import get_active_session
 from lockin.ui import format_duration
 
 POLL_INTERVAL = 1  # seconds
+PID_FILE = Path("/tmp/lockin-menubar.pid")
 
 
-def _create_lock_icon():
-    """Create a lock template icon for the menu bar using SF Symbols."""
+def _create_sf_icon(symbol_name: str):
+    """Create a template NSImage from an SF Symbol name."""
     try:
         from AppKit import NSImage
 
         icon = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            "lock.fill", "Lockin"
+            symbol_name, "Lockin"
         )
         if icon:
             icon.setTemplate_(True)
@@ -31,33 +32,54 @@ def _create_lock_icon():
     return None
 
 
-def _is_already_running() -> bool:
-    """Check if another lockin-menubar process is already running."""
-    my_pid = os.getpid()
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+def _hide_dock_icon():
+    """Hide the Python rocketship from the Dock."""
+    try:
+        from AppKit import NSApp, NSApplicationActivationPolicyAccessory
+
+        NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    except Exception:
+        pass
+
+
+def _acquire_pid_lock() -> bool:
+    """Write our PID to a lock file. Returns False if another instance is alive."""
+    if PID_FILE.exists():
         try:
-            if proc.info["pid"] == my_pid:
-                continue
-            cmdline = proc.info.get("cmdline") or []
-            # Match the actual entry point: "-m lockin.menubar" or a binary named lockin-menubar
-            has_module = "-m" in cmdline and "lockin.menubar" in cmdline
-            has_binary = any(arg.endswith("lockin-menubar") for arg in cmdline[:1])
-            if has_module or has_binary:
-                return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return False
+            old_pid = int(PID_FILE.read_text().strip())
+            # Check if that process is still alive
+            os.kill(old_pid, 0)
+            return False  # still running
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass  # stale PID file
+    PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_pid_lock():
+    """Remove the PID file on exit."""
+    try:
+        if PID_FILE.exists() and PID_FILE.read_text().strip() == str(os.getpid()):
+            PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 class LockinMenuBar(rumps.App):
     """Menu bar app that displays the current focus session status."""
 
     def __init__(self):
-        super().__init__("Lockin", title=None, quit_button=None)
-        # Set SF Symbol lock icon directly (bypasses file-based icon loading)
-        icon = _create_lock_icon()
-        if icon:
-            self._icon = icon
+        super().__init__("Lockin", title="lockin", quit_button=None)
+
+        # Pre-create both icons
+        self._icon_unlocked = _create_sf_icon("lock.open")
+        self._icon_locked = _create_sf_icon("lock.fill")
+
+        # Start with unlocked icon
+        if self._icon_unlocked:
+            self._icon = self._icon_unlocked
+
+        self._session_active = False
 
         # Initialize activity tracker
         self._tracker = None
@@ -78,6 +100,14 @@ class LockinMenuBar(rumps.App):
         self.timer = rumps.Timer(self._tick, POLL_INTERVAL)
         self.timer.start()
 
+    def _set_icon(self, nsimage):
+        """Update the status bar button image directly."""
+        self._icon = nsimage
+        try:
+            self._nsapp.nsstatusitem.button().setImage_(nsimage)
+        except (AttributeError, TypeError):
+            pass
+
     def _tick(self, _sender):
         """Poll session state and update the menu bar."""
         # Activity tracking — must never crash the menubar
@@ -90,7 +120,11 @@ class LockinMenuBar(rumps.App):
         session = get_active_session()
 
         if session is None:
-            self.title = None
+            if self._session_active:
+                self._session_active = False
+                if self._icon_unlocked:
+                    self._set_icon(self._icon_unlocked)
+            self.title = "lockin"
             self.menu.clear()
             self.menu = [
                 rumps.MenuItem("No active session", callback=None),
@@ -99,6 +133,11 @@ class LockinMenuBar(rumps.App):
                 rumps.MenuItem("Quit", callback=self._quit),
             ]
             return
+
+        if not self._session_active:
+            self._session_active = True
+            if self._icon_locked:
+                self._set_icon(self._icon_locked)
 
         remaining = session.remaining_seconds
         elapsed = session.elapsed_seconds
@@ -109,7 +148,7 @@ class LockinMenuBar(rumps.App):
         domains_count = len(session.blocked_domains)
         apps_count = len(session.blocked_apps)
 
-        self.title = format_duration(remaining)
+        self.title = f"lockedin {format_duration(remaining)}"
         self.menu.clear()
         self.menu = [
             rumps.MenuItem(f"Profile: {session.profile_name}", callback=None),
@@ -145,15 +184,22 @@ class LockinMenuBar(rumps.App):
                 self._tracker.shutdown()
             except Exception:
                 pass
+        _release_pid_lock()
         rumps.quit_application()
 
 
 def main():
     """Entry point for the lockin-menubar command."""
-    if _is_already_running():
+    _hide_dock_icon()
+
+    if not _acquire_pid_lock():
         print("lockin-menubar is already running.")
         sys.exit(0)
-    LockinMenuBar().run()
+
+    try:
+        LockinMenuBar().run()
+    finally:
+        _release_pid_lock()
 
 
 if __name__ == "__main__":
