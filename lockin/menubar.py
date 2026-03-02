@@ -9,7 +9,7 @@ from pathlib import Path
 
 import rumps
 
-from lockin.session import get_active_session
+from lockin.session import get_active_session, load_attempts
 from lockin.ui import format_duration
 
 POLL_INTERVAL = 1  # seconds
@@ -155,6 +155,9 @@ class LockinMenuBar(rumps.App):
         domains_count = len(session.blocked_domains)
         apps_count = len(session.blocked_apps)
 
+        attempts = load_attempts()
+        attempt_count = len(attempts)
+
         self.title = f"lockedin {format_duration(remaining)}"
         self.menu.clear()
         self.menu = [
@@ -162,6 +165,7 @@ class LockinMenuBar(rumps.App):
             rumps.MenuItem(f"Remaining: {format_duration(remaining)}", callback=None),
             rumps.MenuItem(f"Progress: {percent}%", callback=None),
             rumps.MenuItem(f"Blocking: {domains_count} domains, {apps_count} apps", callback=None),
+            rumps.MenuItem(f"Blocked attempts: {attempt_count}", callback=None),
             None,
             rumps.MenuItem("Today's Recap", callback=self._show_recap),
             rumps.MenuItem("Quit", callback=self._quit),

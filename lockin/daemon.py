@@ -197,21 +197,25 @@ def _enforce_blocks(sess: session.Session) -> None:
     if not blocker.are_blocks_applied(sess.blocked_domains):
         _log("Blocks missing from /etc/hosts, re-applying")
         blocker.apply_blocks(sess.blocked_domains)
+        session.log_attempt("bypass", "/etc/hosts blocks removed")
 
     # 2. Hosts immutable flag
     if not blocker.is_immutable():
         _log("Immutable flag missing, re-setting")
         blocker.set_immutable_flag()
+        session.log_attempt("bypass", "/etc/hosts immutable flag removed")
 
     # 3. pfctl rules
     if not blocker.are_pfctl_rules_applied():
         _log("pfctl rules missing, re-applying")
         blocker.apply_pfctl_rules(sess.blocked_domains)
+        session.log_attempt("bypass", "pfctl firewall rules flushed")
 
     # 4. Session file immutable
     if not session.is_session_immutable():
         _log("Session file immutable flag missing, re-setting")
         session.set_session_immutable()
+        session.log_attempt("bypass", "Session file tampered")
 
     # 5. Plist protected
     _protect_plist()
@@ -221,6 +225,8 @@ def _enforce_blocks(sess: session.Session) -> None:
 
     # 7. Kill blocked apps
     killed = apps.kill_blocked_apps(sess.blocked_apps)
+    for app_name in killed:
+        session.log_attempt("app", app_name)
     if killed:
         _log(f"Killed blocked apps: {', '.join(killed)}")
 
@@ -229,16 +235,48 @@ def _cleanup(sess: session.Session) -> None:
     """Remove all protections and clean up after a valid expired session."""
     _log("Session expired, cleaning up")
 
+    # Log attempt summary
+    attempts = session.load_attempts()
+    if attempts:
+        app_attempts = [a for a in attempts if a["category"] == "app"]
+        bypass_attempts = [a for a in attempts if a["category"] == "bypass"]
+        _log(f"Session summary: {len(app_attempts)} app blocks, {len(bypass_attempts)} bypass attempts")
+
     # 1. Remove package protection
     _protect_package(protect=False)
 
-    # 2. Remove session immutability + delete session
+    # 2. Archive attempts to user-readable location, then clear
+    _archive_attempts(sess, attempts)
+    session.clear_attempts()
+
+    # 3. Remove session immutability + delete session
     session.delete_session()
 
-    # 3. Remove hosts blocks + pfctl rules
+    # 4. Remove hosts blocks + pfctl rules
     blocker.remove_blocks()
 
     _log("Cleanup complete")
+
+
+def _archive_attempts(sess: session.Session, attempts: list[dict]) -> None:
+    """Save the attempts log to ~/.config/lockin/history/ for later review."""
+    if not attempts:
+        return
+    try:
+        history_dir = Path.home() / ".config" / "lockin" / "history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(sess.start_time))
+        archive = {
+            "profile": sess.profile_name,
+            "start_time": sess.start_time,
+            "end_time": sess.end_time,
+            "duration_seconds": sess.duration_seconds,
+            "attempts": attempts,
+        }
+        archive_file = history_dir / f"session_{timestamp}.json"
+        archive_file.write_text(json.dumps(archive, indent=2) + "\n")
+    except OSError:
+        pass
 
 
 def _load_schedule_state() -> dict[str, str]:

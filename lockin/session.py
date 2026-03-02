@@ -12,6 +12,7 @@ from pathlib import Path
 
 SESSION_DIR = Path("/var/lockin")
 SESSION_FILE = SESSION_DIR / "session.json"
+ATTEMPTS_FILE = SESSION_DIR / "attempts.json"
 HMAC_ITERATIONS = 100_000
 
 
@@ -183,6 +184,39 @@ def delete_session() -> None:
     try:
         remove_session_immutable()
         SESSION_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def log_attempt(category: str, name: str) -> None:
+    """Log a blocked attempt (app killed, hosts tampered, etc.)."""
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        attempts = load_attempts()
+        attempts.append({
+            "time": time.time(),
+            "category": category,
+            "name": name,
+        })
+        ATTEMPTS_FILE.write_text(json.dumps(attempts, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def load_attempts() -> list[dict]:
+    """Load the attempts log for the current session."""
+    if not ATTEMPTS_FILE.exists():
+        return []
+    try:
+        return json.loads(ATTEMPTS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def clear_attempts() -> None:
+    """Remove the attempts log file."""
+    try:
+        ATTEMPTS_FILE.unlink(missing_ok=True)
     except OSError:
         pass
 
