@@ -13,37 +13,73 @@ from lockin.session import get_active_session, load_attempts
 from lockin.ui import format_duration
 
 # ---------------------------------------------------------------------------
-# Do Not Disturb helpers
+# Do Not Disturb helpers (macOS 12+ Focus mode via Shortcuts CLI)
 # ---------------------------------------------------------------------------
 
+_DND_SHORTCUT_NAME = "lockin-dnd"
 
-def _get_dnd_state() -> bool:
-    """Check if macOS Do Not Disturb is currently enabled."""
+
+def _is_dnd_shortcut_installed() -> bool:
+    """Check if the lockin-dnd shortcut exists in Shortcuts.app."""
     import subprocess
 
     try:
         result = subprocess.run(
-            ["defaults", "-currentHost", "read", "com.apple.notificationcenterui", "doNotDisturb"],
-            capture_output=True, text=True,
+            ["shortcuts", "list"],
+            capture_output=True, text=True, timeout=5,
         )
-        return result.stdout.strip() == "1"
+        return _DND_SHORTCUT_NAME in result.stdout.splitlines()
+    except Exception:
+        return False
+
+
+def _get_dnd_state() -> bool:
+    """Check if a Focus mode is currently active via Accessibility API.
+
+    Reads the Focus menu bar item description from ControlCenter.
+    When no Focus is active, description is "Focus".
+    When active, it includes the mode name (e.g. "Focus, Do Not Disturb").
+    """
+    import subprocess
+
+    script = '''\
+tell application "System Events"
+    tell process "ControlCenter"
+        set focusItems to (every menu bar item of menu bar 1 whose description contains "Focus")
+        if (count of focusItems) > 0 then
+            return description of item 1 of focusItems
+        end if
+    end tell
+end tell
+return "Focus"'''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        desc = result.stdout.strip()
+        # "Focus" = inactive, anything else like "Focus, Do Not Disturb" = active
+        return desc != "Focus" and "Focus" in desc
     except Exception:
         return False
 
 
 def _set_dnd(enabled: bool) -> None:
-    """Toggle macOS Do Not Disturb. Only toggles if current state differs."""
-    current = _get_dnd_state()
-    if current == enabled:
+    """Enable or disable DND via the lockin-dnd Shortcut (macOS 12+).
+
+    Requires a Shortcut named 'lockin-dnd' that accepts 'on'/'off' as input
+    and uses the 'Set Focus' action accordingly.
+    """
+    import subprocess
+
+    if not _is_dnd_shortcut_installed():
         return
     try:
-        from Foundation import NSDistributedNotificationCenter, NSObject
-        center = NSDistributedNotificationCenter.defaultCenter()
-        center.postNotificationName_object_userInfo_deliverImmediately_(
-            "com.apple.notificationcenterui.toggleDND",
-            None,
-            None,
-            True,
+        value = "on" if enabled else "off"
+        subprocess.run(
+            ["shortcuts", "run", _DND_SHORTCUT_NAME],
+            input=value, text=True, timeout=10,
+            capture_output=True,
         )
     except Exception:
         pass

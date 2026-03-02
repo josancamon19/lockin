@@ -952,7 +952,12 @@ def _build_settings_menu() -> list[tuple[str, str]]:
     else:
         ss_label = "[red]OFF[/red]"
 
-    ns_status = "[green]ON[/green]" if config.notification_suppression else "[red]OFF[/red]"
+    if config.notification_suppression:
+        from lockin.menubar import _is_dnd_shortcut_installed
+        shortcut_ok = _is_dnd_shortcut_installed()
+        ns_status = "[green]ON[/green]" if shortcut_ok else "[yellow]ON[/yellow] (shortcut missing)"
+    else:
+        ns_status = "[red]OFF[/red]"
 
     return [
         ("1", "Check daemon status"),
@@ -1267,6 +1272,24 @@ def _flow_settings() -> None:
             save_config(config)
             state = "enabled" if config.notification_suppression else "disabled"
             print_success(f"Notification suppression {state}.")
+            if config.notification_suppression:
+                # Check if the shortcut is installed
+                from lockin.menubar import _is_dnd_shortcut_installed
+                if not _is_dnd_shortcut_installed():
+                    print_warning("Shortcut 'lockin-dnd' not found in Shortcuts.app.")
+                    console.print()
+                    console.print("  [bold]To enable DND automation, create a shortcut:[/bold]")
+                    console.print("  1. Open [bold]Shortcuts.app[/bold]")
+                    console.print("  2. Create a new shortcut named [bold cyan]lockin-dnd[/bold cyan]")
+                    console.print("  3. Add: [dim]Shortcut Input[/dim] (receive text)")
+                    console.print("  4. Add: [dim]If[/dim] > Input [dim]equals[/dim] \"on\"")
+                    console.print("  5. Add: [dim]Set Focus[/dim] > Turn Do Not Disturb [bold green]On[/bold green] > Until Turned Off")
+                    console.print("  6. Add: [dim]Otherwise[/dim]")
+                    console.print("  7. Add: [dim]Set Focus[/dim] > Turn Do Not Disturb [bold red]Off[/bold red]")
+                    console.print("  8. Add: [dim]End If[/dim]")
+                    console.print()
+                    if prompt_confirm("Open Shortcuts.app now?"):
+                        subprocess.Popen(["open", "-a", "Shortcuts"])
 
 
 # ---------------------------------------------------------------------------
