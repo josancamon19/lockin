@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from lockin import blocker, apps, session
+from lockin import blocker, apps, blockpage, session
 
 PLIST_LABEL = "com.lockin.watchdog"
 PLIST_PATH = Path(f"/Library/LaunchDaemons/{PLIST_LABEL}.plist")
@@ -21,6 +21,7 @@ LOG_FILE = Path("/var/log/lockin.log")
 ERROR_LOG_FILE = Path("/var/log/lockin_error.log")
 WATCHDOG_INTERVAL = 3  # seconds
 SCHEDULE_STATE_FILE = Path("/var/lockin/schedule_state.json")
+BUDGET_STATE_FILE = Path("/var/lockin/budget_state.json")
 
 
 def _log(msg: str) -> None:
@@ -424,6 +425,90 @@ def _try_trigger_schedule(
     _save_schedule_state(state)
 
 
+def _load_budget_state() -> dict[str, str]:
+    """Load budget block state: {domain: "YYYY-MM-DD"} tracking which domains are budget-blocked."""
+    try:
+        if BUDGET_STATE_FILE.exists():
+            return json.loads(BUDGET_STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_budget_state(state: dict[str, str]) -> None:
+    """Write budget block state to disk."""
+    try:
+        BUDGET_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BUDGET_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _check_budgets() -> None:
+    """Check all time budgets and block domains that have exceeded their daily limit."""
+    from lockin.config import load_config
+    from lockin.activity_db import query_top_domains
+    from lockin.presets import SUBDOMAIN_PREFIXES
+
+    config = load_config()
+    if not config.time_budgets:
+        # If no budgets configured but budget blocks exist, clean them up
+        if blocker.are_budget_blocks_applied():
+            blocker.remove_budget_blocks()
+            _save_budget_state({})
+        return
+
+    today = datetime.now().date()
+    today_str = today.isoformat()
+
+    state = _load_budget_state()
+
+    # Prune stale entries (domains blocked on previous days)
+    stale_keys = [d for d, blocked_date in state.items() if blocked_date != today_str]
+    for k in stale_keys:
+        del state[k]
+    if stale_keys:
+        _save_budget_state(state)
+
+    # Query today's domain usage
+    usage = query_top_domains(today, limit=500)
+    usage_by_domain: dict[str, float] = {}
+    for row in usage:
+        domain = row.get("domain")
+        seconds = row.get("total_seconds", 0)
+        if domain and seconds:
+            usage_by_domain[domain] = seconds
+
+    # Check each budget
+    newly_blocked: list[str] = []
+    for budget in config.time_budgets:
+        if budget.domain in state:
+            # Already blocked today
+            newly_blocked.append(budget.domain)
+            continue
+
+        limit_seconds = budget.daily_limit_minutes * 60
+        used = usage_by_domain.get(budget.domain, 0)
+
+        if used >= limit_seconds:
+            _log(f"Budget exceeded for {budget.domain}: {used:.0f}s used, {limit_seconds}s limit")
+            state[budget.domain] = today_str
+            newly_blocked.append(budget.domain)
+
+    if newly_blocked:
+        # Expand with subdomain prefixes
+        expanded: list[str] = []
+        for domain in newly_blocked:
+            for prefix in SUBDOMAIN_PREFIXES:
+                expanded.append(f"{prefix}{domain}")
+        blocker.apply_budget_blocks(expanded)
+        _save_budget_state(state)
+    elif blocker.are_budget_blocks_applied():
+        # No domains exceeded but blocks exist (new day reset)
+        blocker.remove_budget_blocks()
+        _save_budget_state({})
+
+
 def _setup_signal_handlers() -> None:
     """Ignore SIGTERM/SIGINT during active sessions so launchctl bootout can't stop us.
 
@@ -447,6 +532,13 @@ def watchdog_loop() -> None:
     _setup_signal_handlers()
     _log("Watchdog daemon started")
 
+    # Start block page HTTP server (runs for daemon lifetime, harmless when idle)
+    try:
+        blockpage.start_block_page_server()
+        _log("Block page server started on port 80")
+    except Exception as e:
+        _log(f"Failed to start block page server: {e}")
+
     while True:
         try:
             sess = session.load_session()
@@ -463,6 +555,9 @@ def watchdog_loop() -> None:
 
                 # Check if any schedule should auto-start a session
                 _check_schedules()
+
+                # Check time budgets
+                _check_budgets()
 
                 time.sleep(WATCHDOG_INTERVAL)
                 continue
@@ -486,6 +581,9 @@ def watchdog_loop() -> None:
 
             # Active valid session — enforce blocks
             _enforce_blocks(sess)
+
+            # Check time budgets even during active sessions
+            _check_budgets()
 
         except Exception as e:
             _log(f"ERROR in watchdog loop: {e}")

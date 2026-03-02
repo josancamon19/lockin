@@ -9,6 +9,8 @@ from pathlib import Path
 HOSTS_FILE = Path("/etc/hosts")
 BLOCK_START = "# >>> LOCKIN BLOCK START >>>"
 BLOCK_END = "# <<< LOCKIN BLOCK END <<<"
+BUDGET_BLOCK_START = "# >>> LOCKIN BUDGET START >>>"
+BUDGET_BLOCK_END = "# <<< LOCKIN BUDGET END <<<"
 
 # pfctl (packet filter) paths
 PFCTL_DIR = Path("/var/lockin")
@@ -30,7 +32,7 @@ def _get_block_entries(domains: list[str]) -> str:
     lines = [BLOCK_START]
     for domain in sorted(set(domains)):
         if domain:  # skip empty strings
-            lines.append(f"0.0.0.0 {domain}")
+            lines.append(f"127.0.0.1 {domain}")
     lines.append(BLOCK_END)
     return "\n".join(lines)
 
@@ -220,6 +222,89 @@ def are_blocks_applied(domains: list[str]) -> bool:
     except PermissionError:
         return False
     return BLOCK_START in content and BLOCK_END in content
+
+
+def _get_budget_block_entries(domains: list[str]) -> str:
+    """Generate /etc/hosts budget block entries with budget sentinels."""
+    lines = [BUDGET_BLOCK_START]
+    for domain in sorted(set(domains)):
+        if domain:
+            lines.append(f"127.0.0.1 {domain}")
+    lines.append(BUDGET_BLOCK_END)
+    return "\n".join(lines)
+
+
+def _strip_existing_budget_blocks(content: str) -> str:
+    """Remove any existing lockin budget block section from hosts content."""
+    lines = content.splitlines()
+    result: list[str] = []
+    inside_block = False
+    for line in lines:
+        if line.strip() == BUDGET_BLOCK_START:
+            inside_block = True
+            continue
+        if line.strip() == BUDGET_BLOCK_END:
+            inside_block = False
+            continue
+        if not inside_block:
+            result.append(line)
+    while result and result[-1].strip() == "":
+        result.pop()
+    return "\n".join(result)
+
+
+def apply_budget_blocks(domains: list[str]) -> bool:
+    """Write budget domain blocks to /etc/hosts (independent from session blocks).
+
+    Returns True if blocks were applied successfully.
+    """
+    if not domains:
+        return True
+
+    remove_immutable_flag()
+
+    try:
+        current = _read_hosts()
+        clean = _strip_existing_budget_blocks(current)
+        block_entries = _get_budget_block_entries(domains)
+        new_content = clean + "\n\n" + block_entries + "\n"
+        HOSTS_FILE.write_text(new_content)
+    except PermissionError:
+        return False
+
+    set_immutable_flag()
+    flush_dns_cache()
+    return True
+
+
+def remove_budget_blocks() -> bool:
+    """Remove budget blocks from /etc/hosts (leaves session blocks intact).
+
+    Returns True if blocks were removed successfully.
+    """
+    remove_immutable_flag()
+
+    try:
+        current = _read_hosts()
+        clean = _strip_existing_budget_blocks(current)
+        if not clean.endswith("\n"):
+            clean += "\n"
+        HOSTS_FILE.write_text(clean)
+    except PermissionError:
+        return False
+
+    set_immutable_flag()
+    flush_dns_cache()
+    return True
+
+
+def are_budget_blocks_applied() -> bool:
+    """Check if budget blocks are present in /etc/hosts."""
+    try:
+        content = _read_hosts()
+    except PermissionError:
+        return False
+    return BUDGET_BLOCK_START in content and BUDGET_BLOCK_END in content
 
 
 def is_immutable() -> bool:

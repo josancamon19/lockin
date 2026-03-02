@@ -12,7 +12,7 @@ from pathlib import Path
 from lockin import __version__
 from lockin.apps import list_installed_apps
 from lockin.blocker import apply_blocks, remove_blocks
-from lockin.config import Config, Profile, Schedule, load_config, resolve_blocked_lists, save_config
+from lockin.config import Config, Profile, Schedule, TimeBudget, load_config, resolve_blocked_lists, save_config
 from lockin.daemon import install_daemon, is_daemon_installed, uninstall_daemon
 from lockin.presets import PRESETS, list_presets
 from lockin.session import (
@@ -292,6 +292,7 @@ MAIN_MENU_OPTIONS = [
     ("5", "View Presets           \u2014  show built-in categories (read-only)"),
     ("6", "Activity Recap         \u2014  daily / weekly productivity reports"),
     ("7", "Settings & Info        \u2014  daemon status, installed apps, version"),
+    ("8", "Time Budgets           \u2014  daily domain time limits"),
     ("0", "Exit"),
 ]
 
@@ -316,6 +317,8 @@ def _main_menu() -> None:
             _flow_activity_recap()
         elif choice == "7":
             _flow_settings()
+        elif choice == "8":
+            _flow_time_budgets()
         elif choice == "0":
             console.print("[dim]Goodbye![/dim]")
             break
@@ -869,6 +872,72 @@ def _flow_activity_recap() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Flow: Time Budgets
+# ---------------------------------------------------------------------------
+
+TIME_BUDGET_MENU = [
+    ("1", "View all budgets"),
+    ("2", "Add a budget"),
+    ("3", "Remove a budget"),
+    ("0", "Back"),
+]
+
+
+def _flow_time_budgets() -> None:
+    while True:
+        choice = show_menu("Time Budgets", TIME_BUDGET_MENU)
+        if choice == "0":
+            return
+        elif choice == "1":
+            config = load_config()
+            if not config.time_budgets:
+                print_warning("No time budgets configured.")
+            else:
+                rows = [
+                    f"{tb.domain}  \u2014  {tb.daily_limit_minutes} min/day"
+                    for tb in config.time_budgets
+                ]
+                show_numbered_list("Time Budgets", rows)
+        elif choice == "2":
+            domain = prompt_text("Domain (e.g. youtube.com)")
+            if not domain:
+                continue
+            config = load_config()
+            existing = [tb.domain for tb in config.time_budgets]
+            if domain in existing:
+                print_warning(f"Budget for '{domain}' already exists.")
+                continue
+            minutes_str = prompt_text("Daily limit in minutes", default="30")
+            try:
+                minutes = int(minutes_str)
+                if minutes < 1:
+                    print_error("Must be at least 1 minute.")
+                    continue
+            except ValueError:
+                print_error("Invalid number.")
+                continue
+            config.time_budgets.append(TimeBudget(domain=domain, daily_limit_minutes=minutes))
+            save_config(config)
+            print_success(f"Budget added: {domain} \u2014 {minutes} min/day")
+        elif choice == "3":
+            config = load_config()
+            if not config.time_budgets:
+                print_warning("No time budgets to remove.")
+                continue
+            rows = [
+                f"{tb.domain}  \u2014  {tb.daily_limit_minutes} min/day"
+                for tb in config.time_budgets
+            ]
+            show_numbered_list("Time Budgets", rows)
+            nums = prompt_pick_numbers("Budget number to remove", len(config.time_budgets))
+            if not nums:
+                continue
+            removed = config.time_budgets.pop(nums[0] - 1)
+            save_config(config)
+            print_success(f"Removed budget for '{removed.domain}'.")
+
+
+# ---------------------------------------------------------------------------
 # Flow: Settings & Info
 # ---------------------------------------------------------------------------
 
@@ -883,6 +952,8 @@ def _build_settings_menu() -> list[tuple[str, str]]:
     else:
         ss_label = "[red]OFF[/red]"
 
+    ns_status = "[green]ON[/green]" if config.notification_suppression else "[red]OFF[/red]"
+
     return [
         ("1", "Check daemon status"),
         ("2", "Install daemon"),
@@ -894,6 +965,7 @@ def _build_settings_menu() -> list[tuple[str, str]]:
         ("8", "Uninstall menu bar auto-start"),
         ("9", f"Accessibility permission [{ax_status}]  \u2014  needed for URL tracking"),
         ("s", f"Screenshot capture [{ss_label}]"),
+        ("n", f"Notification suppression [{ns_status}]  \u2014  DND during sessions"),
         ("0", "Back"),
     ]
 
@@ -1189,6 +1261,12 @@ def _flow_settings() -> None:
             _flow_grant_accessibility()
         elif choice == "s":
             _flow_screenshot_settings()
+        elif choice == "n":
+            config = load_config()
+            config.notification_suppression = not config.notification_suppression
+            save_config(config)
+            state = "enabled" if config.notification_suppression else "disabled"
+            print_success(f"Notification suppression {state}.")
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,42 @@ import rumps
 from lockin.session import get_active_session, load_attempts
 from lockin.ui import format_duration
 
+# ---------------------------------------------------------------------------
+# Do Not Disturb helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_dnd_state() -> bool:
+    """Check if macOS Do Not Disturb is currently enabled."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["defaults", "-currentHost", "read", "com.apple.notificationcenterui", "doNotDisturb"],
+            capture_output=True, text=True,
+        )
+        return result.stdout.strip() == "1"
+    except Exception:
+        return False
+
+
+def _set_dnd(enabled: bool) -> None:
+    """Toggle macOS Do Not Disturb. Only toggles if current state differs."""
+    current = _get_dnd_state()
+    if current == enabled:
+        return
+    try:
+        from Foundation import NSDistributedNotificationCenter, NSObject
+        center = NSDistributedNotificationCenter.defaultCenter()
+        center.postNotificationName_object_userInfo_deliverImmediately_(
+            "com.apple.notificationcenterui.toggleDND",
+            None,
+            None,
+            True,
+        )
+    except Exception:
+        pass
+
 POLL_INTERVAL = 1  # seconds
 PID_FILE = Path("/tmp/lockin-menubar.pid")
 
@@ -87,6 +123,7 @@ class LockinMenuBar(rumps.App):
             self._icon = self._icon_unlocked
 
         self._session_active = False
+        self._dnd_was_on_before_session: bool | None = None
 
         # Initialize activity tracker
         self._tracker = None
@@ -131,6 +168,13 @@ class LockinMenuBar(rumps.App):
                 self._session_active = False
                 if self._icon_unlocked:
                     self._set_icon(self._icon_unlocked)
+                # Restore DND state
+                if self._dnd_was_on_before_session is False:
+                    try:
+                        _set_dnd(False)
+                    except Exception:
+                        pass
+                self._dnd_was_on_before_session = None
             self.title = "lockin"
             self.menu.clear()
             self.menu = [
@@ -145,6 +189,15 @@ class LockinMenuBar(rumps.App):
             self._session_active = True
             if self._icon_locked:
                 self._set_icon(self._icon_locked)
+            # Enable DND if notification suppression is on
+            try:
+                from lockin.config import load_config
+                config = load_config()
+                if config.notification_suppression:
+                    self._dnd_was_on_before_session = _get_dnd_state()
+                    _set_dnd(True)
+            except Exception:
+                pass
 
         remaining = session.remaining_seconds
         elapsed = session.elapsed_seconds

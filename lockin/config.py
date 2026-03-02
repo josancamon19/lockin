@@ -63,6 +63,12 @@ class ScreenshotSettings:
 
 
 @dataclass
+class TimeBudget:
+    domain: str
+    daily_limit_minutes: int
+
+
+@dataclass
 class AlwaysBlocked:
     sites: list[str] = field(default_factory=list)
     apps: list[str] = field(default_factory=list)
@@ -74,6 +80,8 @@ class Config:
     schedules: dict[str, Schedule] = field(default_factory=dict)
     always_blocked: AlwaysBlocked = field(default_factory=AlwaysBlocked)
     screenshot_settings: ScreenshotSettings = field(default_factory=ScreenshotSettings)
+    time_budgets: list[TimeBudget] = field(default_factory=list)
+    notification_suppression: bool = True
 
 
 def _ensure_config_dir() -> None:
@@ -110,11 +118,22 @@ def load_config() -> Config:
         retention_days=ss.get("retention_days", 7),
     )
 
+    time_budgets = []
+    for tb in raw.get("time_budgets", []):
+        time_budgets.append(TimeBudget(
+            domain=tb.get("domain", ""),
+            daily_limit_minutes=tb.get("daily_limit_minutes", 30),
+        ))
+
+    notification_suppression = raw.get("notification_suppression", True)
+
     return Config(
         profiles=profiles,
         schedules=schedules,
         always_blocked=always_blocked,
         screenshot_settings=screenshot_settings,
+        time_budgets=time_budgets,
+        notification_suppression=notification_suppression,
     )
 
 
@@ -125,6 +144,8 @@ def save_config(config: Config) -> None:
         "schedules": {name: asdict(s) for name, s in config.schedules.items()},
         "always_blocked": asdict(config.always_blocked),
         "screenshot_settings": asdict(config.screenshot_settings),
+        "time_budgets": [asdict(tb) for tb in config.time_budgets],
+        "notification_suppression": config.notification_suppression,
     }
     CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
 
