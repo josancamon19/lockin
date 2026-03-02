@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import signal
 import subprocess
 from pathlib import Path
 
@@ -66,10 +67,29 @@ def is_app_running(app_name: str) -> bool:
 
 
 def kill_blocked_apps(app_names: list[str]) -> list[str]:
-    """Kill all blocked apps that are currently running. Returns list of killed app names."""
-    killed: list[str] = []
-    for app_name in app_names:
-        if is_app_running(app_name):
-            if kill_app(app_name):
-                killed.append(app_name)
-    return killed
+    """Kill all blocked apps instantly via SIGKILL.
+
+    Single pass over the process table, immediate kill — no graceful quit,
+    no subprocess spawn.  Apps should never visibly open.
+    """
+    if not app_names:
+        return []
+
+    blocked_lower = {name.lower() for name in app_names}
+    killed_names: set[str] = set()
+
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            proc_name = proc.info["name"]
+            if not proc_name:
+                continue
+            proc_name_lower = proc_name.lower()
+            for blocked in blocked_lower:
+                if blocked in proc_name_lower:
+                    proc.send_signal(signal.SIGKILL)
+                    killed_names.add(proc_name)
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+            continue
+
+    return sorted(killed_names)
